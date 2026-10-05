@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fixwire"
+description = "Fixwire SDK for Python: errors, traces and AI agents, with sync and async clients"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+dependencies = ["urllib3>=1.26.11"]
+dynamic = ["version"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Framework :: AsyncIO",
+  "Topic :: System :: Monitoring",
+]
+
+[project.optional-dependencies]
+async = ["httpx>=0.27"]
+
+[dependency-groups]
+dev = ["pytest>=8", "httpx>=0.27", "starlette>=0.40", "fastapi>=0.115", "django>=5.0", "celery>=5.4", "flask>=3.0", "requests>=2.31", "types-requests>=2.31",
+       "mypy>=2.4", "pyright>=1.1.414", "django-stubs>=6.1", "celery-types>=0.26", "anthropic>=1.0",
+       "openai>=1.60", "opentelemetry-api>=1.30"]
+
+[tool.hatch.version]
+path = "src/fixwire/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fixwire"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests/typing_check.py", "examples"]
+
+[tool.pyright]
+include = ["src", "tests/typing_check.py", "examples"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.10"
+typeCheckingMode = "strict"
+reportUnnecessaryTypeIgnoreComment = "error"
+
+# One Python style for Fixwire: compat/ruff.toml and the monorepo's ruff.toml
+# extend this.
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+# printf-style formatting stays where it is used.
+ignore = ["UP031"]

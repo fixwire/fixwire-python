@@ -1,0 +1,2 @@
+celery[redis]>=5.4
+fixwire>=0.1

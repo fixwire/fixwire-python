@@ -1,0 +1,2 @@
+django>=5.0
+fixwire>=0.1
