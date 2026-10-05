@@ -20,6 +20,19 @@ FILTERED = "[Filtered]"
 
 _WS = r"[\t\n\f\r ]"
 
+# Case-insensitive "s" and "k" as the server folds them (the long s and the
+# Kelvin sign), and the letters its case-insensitive classes add to [A-Za-z].
+_S = "[s\u017f]"
+_K = "[k\u212a]"
+_FOLDED = "\u017f\u212a"
+
+
+def _lower(s: str) -> str:
+    """Lower case one code point at a time, like the server: only U+0130
+    lowers to two code points in Python, and the server makes it "i"."""
+    return (s.replace("\u0130", "i") if "\u0130" in s else s).lower()
+
+
 DEFAULT_SENSITIVE_KEYS = (
     "password",
     "passwd",
@@ -279,19 +292,109 @@ def _credential_like(v: str) -> bool:
     return any("A" <= c <= "Z" for c in rest) and any("a" <= c <= "z" for c in rest)
 
 
+# Scanners for two of the server's patterns: the same leftmost matches in
+# linear time (as regular expressions here they backtrack quadratically on
+# text like "a.a.a….://" or many BEGIN lines without an END).
+
+_KEY_LABEL = "PRIVATE KEY-----"
+
+
+def _key_label_end(s: str, i: int) -> int:
+    """The end of ``(?:[A-Z ]+ )?PRIVATE KEY-----`` at i, or -1. "PRIVATE
+    KEY" can only end the run of capitals and spaces from i."""
+    run = i
+    n = len(s)
+    while run < n and (s[run] in _UPPER or s[run] == " "):
+        run += 1
+    label = run - len("PRIVATE KEY")
+    if label < i or not s.startswith(_KEY_LABEL, label):
+        return -1
+    if label > i and (label < i + 2 or s[label - 1] != " "):
+        return -1  # the type before the label needs a letter or space, then a space
+    return label + len(_KEY_LABEL)
+
+
+def _private_key_spans(s: str) -> list[Span]:
+    """The server's ``-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\\s\\S]*?-----END
+    (?:[A-Z ]+ )?PRIVATE KEY-----``: each BEGIN line with the first END line
+    after it."""
+    out: list[Span] = []
+    start = 0
+    while True:
+        begin = s.find("-----BEGIN ", start)
+        if begin < 0:
+            return out
+        head = _key_label_end(s, begin + 11)
+        if head < 0:
+            start = begin + 1
+            continue
+        end = -1
+        line = s.find("-----END ", head)
+        while line >= 0:
+            end = _key_label_end(s, line + 9)
+            if end >= 0:
+                break
+            line = s.find("-----END ", line + 1)
+        if end < 0:
+            return out  # a later BEGIN line finds no END line either
+        out.append((begin, end))
+        start = end
+
+
+_SCHEME = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-")
+_LETTERS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+_ENDS_PASSWORD = frozenset("\t\n\f\r /?#@")
+
+
+def _url_credential_spans(s: str) -> list[Span]:
+    """The password of the server's ``\\b[A-Za-z][A-Za-z0-9+.\\-]*://[^\\s/?#@:]*:
+    ([^\\s/?#@]+)@``. Every start in the scheme before one "://" shares the
+    rest of the match, so only the first is tried."""
+    out: list[Span] = []
+    n = len(s)
+    start = 0
+    sep = s.find("://")
+    while sep >= 0:
+        scheme = sep
+        while scheme > start and s[scheme - 1] in _SCHEME:
+            scheme -= 1
+        # The first letter at a word boundary starts the scheme.
+        while scheme < sep and not (s[scheme] in _LETTERS and (scheme == 0 or s[scheme - 1] not in _WORD)):
+            scheme += 1
+        if scheme < sep:
+            user = sep + 3
+            while user < n and s[user] != ":" and s[user] not in _ENDS_PASSWORD:
+                user += 1
+            if user < n and s[user] == ":":
+                end = user + 1
+                while end < n and s[end] not in _ENDS_PASSWORD:
+                    end += 1
+                if end > user + 1 and end < n and s[end] == "@":
+                    out.append((user + 1, end))
+                    start = end + 1
+                    sep = s.find("://", start)
+                    continue
+        sep = s.find("://", sep + 1)
+    return out
+
+
 _REGISTRY = (
     _Detector(
         "private_key",
         ("PRIVATE KEY-----",),
         True,
-        _re(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----"),
+        scan=_private_key_spans,
     ),
     _Detector(
         "aws_access_key", ("AKIA", "ASIA", "ABIA", "ACCA"), True, _re(r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b")
     ),
     _Detector("gcp_api_key", ("AIza",), True, _re(r"\bAIza[0-9A-Za-z_\-]{35}")),
     _Detector(
-        "azure_storage_key", ("accountkey=",), False, _re(r"AccountKey=([A-Za-z0-9+/]{86}==)", re.IGNORECASE), group=1
+        "azure_storage_key",
+        ("accountkey=",),
+        False,
+        _re("Account" + _K + "ey=([A-Za-z0-9+/" + _FOLDED + "]{86}==)", re.IGNORECASE),
+        group=1,
     ),
     _Detector(
         "github_token",
@@ -328,8 +431,7 @@ _REGISTRY = (
         "url_credentials",
         ("://",),
         True,
-        _re(r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\t\n\f\r /?#@:]*:([^\t\n\f\r /?#@]+)@"),
-        group=1,
+        scan=_url_credential_spans,
         validate=_not_masked,
     ),
     # Bearer and Basic credentials outside a header (messages, breadcrumbs).
@@ -337,7 +439,7 @@ _REGISTRY = (
         "http_auth",
         ("bearer", "basic"),
         False,
-        _re(r"\b(?:bearer|basic)" + _WS + r"+([A-Za-z0-9._~+/\-]{12,}=*)", re.IGNORECASE),
+        _re(r"\b(?:bearer|ba" + _S + "ic)" + _WS + r"+([A-Za-z0-9._~+/\-" + _FOLDED + "]{12,}=*)", re.IGNORECASE),
         group=1,
         validate=_credential_like,
     ),
@@ -346,7 +448,24 @@ _REGISTRY = (
         ("pass", "secret", "token", "api_key", "apikey", "api-key", "pwd"),
         False,
         _re(
-            r"\b(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)[\"']?"
+            r"\b(?:pa"
+            + _S
+            + _S
+            + "word|pa"
+            + _S
+            + _S
+            + "wd|pwd|"
+            + _S
+            + "ecret|to"
+            + _K
+            + "en|api[_-]?"
+            + _K
+            + "ey|acce"
+            + _S
+            + _S
+            + "[_-]?"
+            + _K
+            + r"ey)[\"']?"
             + _WS
             + r"*[:=]"
             + _WS
@@ -379,7 +498,7 @@ DEFAULT_DETECTORS = tuple(d.name for d in _REGISTRY if d.name != "ipv4")
 
 
 def _normalize_key(k: str) -> str:
-    return k.lower().replace("-", "").replace("_", "").replace(" ", "")
+    return _lower(k).replace("-", "").replace("_", "").replace(" ", "")
 
 
 def _token_count(k: str) -> bool:
@@ -422,7 +541,7 @@ class Redactor:
                 hay = s
                 if not d.case_sensitive:
                     if lower is None:
-                        lower = s.lower()
+                        lower = _lower(s)
                     hay = lower
                 if not any(p in hay for p in d.prefilter):
                     continue
