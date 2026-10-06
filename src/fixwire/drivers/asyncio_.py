@@ -36,6 +36,9 @@ class AsyncioDriver:
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._in_flight: set[Any] = set()
+        # Events taken off the queue and still being encoded: they are in no
+        # queue for a moment, and must count as pending all the same.
+        self._encoding = 0
         self._sem = asyncio.Semaphore(MAX_IN_FLIGHT)
         self._encoder = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="fixwire-encode")
         self._closed = False
@@ -65,7 +68,7 @@ class AsyncioDriver:
             self._task = self.loop.create_task(self._run(), name="fixwire-delivery")
 
     def _pending(self) -> bool:
-        return bool(len(self.core.queue)) or not self.delivery.empty() or bool(self._in_flight)
+        return bool(len(self.core.queue)) or not self.delivery.empty() or bool(self._in_flight) or self._encoding > 0
 
     async def _run(self) -> None:
         while not self._closed:
@@ -92,10 +95,14 @@ class AsyncioDriver:
                 self.delivery.offer(out, time.monotonic())
         events = self.core.queue.drain()
         if events:
-            encoded = await self.loop.run_in_executor(self._encoder, _encode_all, self.core, events)
-            now = time.monotonic()
-            for out in encoded:
-                self.delivery.offer(out, now)
+            self._encoding += 1
+            try:
+                encoded = await self.loop.run_in_executor(self._encoder, _encode_all, self.core, events)
+                now = time.monotonic()
+                for out in encoded:
+                    self.delivery.offer(out, now)
+            finally:
+                self._encoding -= 1
         while True:
             item = self.delivery.next(time.monotonic())
             if item is None:
@@ -132,7 +139,7 @@ class AsyncioDriver:
 
     async def _drained(self) -> None:
         while self._pending():
-            if not len(self.core.queue) and not self._in_flight and self._only_waiting():
+            if not len(self.core.queue) and not self._in_flight and not self._encoding and self._only_waiting():
                 return  # only backoff waits remain
             self._wake.set()
             await asyncio.sleep(0.01)

@@ -187,6 +187,29 @@ def test_async_client_delivers_from_the_loop(ingest):
     assert messages == ["ValueError", "from a thread"]
 
 
+def test_async_flush_waits_for_events_being_encoded(ingest, monkeypatch):
+    # Taken off the queue and still being encoded, events are in no queue for
+    # a moment: aflush() must wait for them, not report everything sent.
+    from fixwire.drivers import asyncio_
+
+    encode_all = asyncio_._encode_all
+
+    def slow(core, events):
+        time.sleep(0.3)
+        return encode_all(core, events)
+
+    monkeypatch.setattr(asyncio_, "_encode_all", slow)
+
+    async def main():
+        async with AsyncClient(ingest.dsn, default_integrations=False) as client:
+            client.capture_message("slow to encode")
+            await asyncio.sleep(0.05)  # the delivery task has taken it off the queue
+            assert await client.aflush(5)
+            assert [e.get("message") for e in ingest.events()] == ["slow to encode"]
+
+    asyncio.run(main())
+
+
 def test_async_client_hands_over_when_the_loop_stops(ingest):
     holder = {}
 

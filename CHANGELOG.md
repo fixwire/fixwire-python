@@ -8,6 +8,7 @@ API.
 
 - A tool call's arguments hash reads at most the first 16,384 bytes of the arguments' JSON, and the JSON's length when it is longer, as the JavaScript SDK does (1.6 MB of JSON took the caller over 100 ms). Hashes of shorter JSON are unchanged.
 - `ai.tool()` no longer raises on arguments with a lone surrogate: the hash escapes it, as the JavaScript SDK does.
+- With `transport="asyncio"`, `aflush()` waits for events still being encoded, and `aclose()` no longer drops them (they were briefly in no queue).
 
 ## [0.1.1] - 2026-10-06
 
