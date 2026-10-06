@@ -50,6 +50,32 @@ def test_asgi_starlette(ingest):
     assert "secret" not in str(ingest.requests[0]["body"]) and "Bearer t" not in str(ingest.requests[0]["body"])
 
 
+def test_asgi_mounted_routes_keep_their_prefix(ingest):
+    from starlette.applications import Starlette
+    from starlette.routing import Mount, Route
+    from starlette.testclient import TestClient
+
+    from fixwire.integrations.asgi import FixwireMiddleware
+
+    async def broken(request):
+        raise ValueError("broken")
+
+    fixwire.init(ingest.dsn, default_integrations=False)
+    v2 = Mount("/v2", routes=[Route("/orders/{id}", broken)])
+    app = Starlette(routes=[Mount("/api", routes=[Route("/items/{id}", broken), v2])])
+    app.add_middleware(FixwireMiddleware)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.get("/api/items/7").status_code == 500
+        assert client.get("/api/v2/orders/9").status_code == 500
+    assert fixwire.flush(5)
+    events = ingest.events()
+    assert [e["transaction"] for e in events] == ["/api/items/{id}", "/api/v2/orders/{id}"]
+    assert [e["request"]["url"] for e in events] == [
+        "http://testserver/api/items/7",
+        "http://testserver/api/v2/orders/9",
+    ]
+
+
 def test_django(ingest, settings_module):
     from django.test import Client as DjangoClient
 
