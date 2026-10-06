@@ -18,6 +18,7 @@ from collections.abc import Generator
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
 
+from fixwire._core.event_builder import safe_str
 from fixwire._core.jsonish import dicts, get_dict
 
 if TYPE_CHECKING:
@@ -74,7 +75,7 @@ class Scope:
 
     def set_tag(self, key: str, value: object) -> None:
         """A searchable key/value on events (values become strings)."""
-        self.tags[key] = value if isinstance(value, str) else str(value)
+        self.tags[key] = value if isinstance(value, str) else safe_str(value)
 
     def remove_tag(self, key: str) -> None:
         self.tags.pop(key, None)

@@ -32,7 +32,7 @@ class AsyncioDriver:
         self.core = core
         self.send = send
         self.loop = loop or asyncio.get_running_loop()
-        self.delivery = Delivery()
+        self.delivery = Delivery(max_items=core.options.max_queue_size)
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._in_flight: set[Any] = set()
@@ -157,10 +157,7 @@ class AsyncioDriver:
     def take_leftovers(self) -> list[Outbound]:
         """Encoded requests not yet sent, for a fallback driver once the
         loop is gone."""
-        out = list(self.delivery.queue)
-        self.delivery.queue.clear()
-        self.delivery.queued_bytes = 0
-        return out
+        return self.delivery.take()
 
 
 def _encode_all(core: Core, events: list[Any]) -> list[Outbound]:

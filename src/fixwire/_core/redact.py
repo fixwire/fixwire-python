@@ -293,9 +293,10 @@ def _credential_like(v: str) -> bool:
     return any("A" <= c <= "Z" for c in rest) and any("a" <= c <= "z" for c in rest)
 
 
-# Scanners for three of the server's patterns: the same leftmost matches in
+# Scanners for four of the server's patterns: the same leftmost matches in
 # linear time (as regular expressions here they backtrack quadratically on
-# text like "a.a.a….://", many BEGIN lines without an END or "eyJ-eyJ-…").
+# text like "a.a.a….://", many BEGIN lines without an END or "eyJ-eyJ-…",
+# and a secret's name backtracks over the spaces after it).
 
 _KEY_LABEL = "PRIVATE KEY-----"
 
@@ -376,6 +377,78 @@ def _url_credential_spans(s: str) -> list[Span]:
                     sep = s.find("://", start)
                     continue
         sep = s.find("://", sep + 1)
+    return out
+
+
+_SECRET_NAME = _re(
+    "pa"
+    + _S
+    + _S
+    + "word|pa"
+    + _S
+    + _S
+    + "wd|pwd|"
+    + _S
+    + "ecret(?:[_-]?"
+    + _K
+    + "ey)?|private[_-]?"
+    + _K
+    + "ey|to"
+    + _K
+    + "en|api[_-]?"
+    + _K
+    + "ey|acce"
+    + _S
+    + _S
+    + "[_-]?"
+    + _K
+    + "ey|credential"
+    + _S
+    + "?|"
+    + _S
+    + "e"
+    + _S
+    + _S
+    + "(?:ion)?[_-]?id|"
+    + _S
+    + "ig(?:nature)?|[?&#]code",
+    re.IGNORECASE,
+)
+_QUOTES = frozenset("\"'")
+_SPACE = frozenset("\t\n\f\r ")
+_ENDS_SECRET = _SPACE | frozenset("\"',;&")
+
+
+def _secret_assignment_spans(s: str) -> list[Span]:
+    """The value of the server's ``(?i)(?:password|passwd|pwd|secret(?:[_-]?key)?|
+    private[_-]?key|token|api[_-]?key|access[_-]?key|credentials?|sess(?:ion)?[_-]?id|
+    sig(?:nature)?|[?&#]code)["']?\\s*[:=]\\s*["']?([^\\s"',;&]{6,})`` in linear
+    time. At most one name can be followed by a separator at each start (a
+    longer one goes on with a letter), so the rest of the match is decided
+    once; the spaces after one name are read from that start only."""
+    out: list[Span] = []
+    n = len(s)
+    m = _SECRET_NAME.search(s)
+    while m is not None:
+        j = m.end()
+        if j < n and s[j] in _QUOTES:
+            j += 1
+        while j < n and s[j] in _SPACE:
+            j += 1
+        if j < n and s[j] in ":=":
+            j += 1
+            while j < n and s[j] in _SPACE:
+                j += 1
+            if j < n and s[j] in _QUOTES:
+                j += 1
+            end = j
+            while end < n and s[end] not in _ENDS_SECRET:
+                end += 1
+            if end - j >= 6:
+                out.append((j, end))
+                m = _SECRET_NAME.search(s, end)
+                continue
+        m = _SECRET_NAME.search(s, m.start() + 1)
     return out
 
 
@@ -480,36 +553,14 @@ _REGISTRY = (
         group=1,
         validate=_credential_like,
     ),
+    # A value given to a secret's name, in text, config and URLs. The name may
+    # end a longer one (access_token, client_secret, csrfToken, PHPSESSID,
+    # X-Amz-Signature); an OAuth code counts in a query or fragment only.
     _Detector(
         "secret_assignment",
-        ("pass", "secret", "token", "api_key", "apikey", "api-key", "pwd"),
+        ("pass", "pwd", "secret", "key", "token", "credential", "sess", "sig", "code"),
         False,
-        _re(
-            r"\b(?:pa"
-            + _S
-            + _S
-            + "word|pa"
-            + _S
-            + _S
-            + "wd|pwd|"
-            + _S
-            + "ecret|to"
-            + _K
-            + "en|api[_-]?"
-            + _K
-            + "ey|acce"
-            + _S
-            + _S
-            + "[_-]?"
-            + _K
-            + r"ey)[\"']?"
-            + _WS
-            + r"*[:=]"
-            + _WS
-            + r"*[\"']?([^\t\n\f\r \"',;&]{6,})",
-            re.IGNORECASE,
-        ),
-        group=1,
+        scan=_secret_assignment_spans,
         validate=_not_masked,
     ),
     _Detector("email", ("@",), True, scan=_email_spans),
@@ -532,6 +583,13 @@ _REGISTRY = (
 )
 
 DEFAULT_DETECTORS = tuple(d.name for d in _REGISTRY if d.name != "ipv4")
+
+
+def _overlaps(spans: list[Span], start: int, end: int) -> bool:
+    """Whether [start, end) overlaps one of spans (sorted and apart): only
+    the last one starting before end can."""
+    i = bisect.bisect_left(spans, (end, -1))
+    return i > 0 and spans[i - 1][1] > start
 
 
 def _normalize_key(k: str) -> str:
@@ -572,9 +630,8 @@ class Redactor:
         """Non-overlapping findings, leftmost first; when two overlap, the
         earlier detector wins."""
         out: list[Finding] = []
-        # The findings' (start, end), sorted: they don't overlap, so their
-        # ends are sorted too and only the last one starting before a new
-        # finding's end can overlap it.
+        # The findings' (start, end) so far, sorted, and the detector's own
+        # (leftmost first): neither overlaps itself, so ends are sorted too.
         taken: list[Span] = []
         lower: str | None = None
         for d in self._detectors:
@@ -588,14 +645,17 @@ class Redactor:
                     continue
             if d.may is not None and not d.may(s):
                 continue
+            found: list[Span] = []
             for start, end in d.spans(s):
                 if d.validate is not None and not d.validate(s[start:end]):
                     continue
-                i = bisect.bisect_left(taken, (end, -1))
-                if i and taken[i - 1][1] > start:
+                if _overlaps(taken, start, end) or _overlaps(found, start, end):
                     continue
-                taken.insert(i, (start, end))
+                found.append((start, end))
                 out.append(Finding(d.name, start, end))
+            if found:
+                taken += found
+                taken.sort()  # two sorted runs: merged in linear time
         out.sort(key=lambda f: f.start)
         return out
 
@@ -613,6 +673,15 @@ class Redactor:
         parts.append(s[last:])
         return "".join(parts), fs
 
+    def mask_or_filter(self, s: str) -> tuple[str, int]:
+        """mask(), and the number of findings; a string it fails on is sent
+        as [Filtered], never unmasked."""
+        try:
+            masked, fs = self.mask(s)
+        except Exception:
+            return FILTERED, 1
+        return masked, len(fs)
+
     def sensitive(self, key: str) -> bool:
         k = _normalize_key(key)
         if k == "auth":
@@ -629,10 +698,12 @@ class Redactor:
     def _walk(self, v: Any, n: list[int]) -> Any:
         if isinstance(v, dict):
             obj = cast("dict[object, Any]", v)
-            renamed: list[str] = []
+            renamed: dict[str, tuple[str, int]] = {}
             for k in list(obj):
-                if isinstance(k, str) and self.mask(k)[0] != k:
-                    renamed.append(k)
+                if isinstance(k, str):
+                    masked, found = self.mask_or_filter(k)
+                    if masked != k:
+                        renamed[k] = masked, found
                 val: Any = obj[k]
                 if isinstance(k, str) and self.sensitive(k) and not _empty(val):
                     # A typed attribute ({"type": …, "value": …}) keeps its shape.
@@ -648,14 +719,17 @@ class Redactor:
                     continue
                 obj[k] = self._walk(val, n)
             # Keys hold data too ({"ada@example.com": 3}). Keys that mask
-            # alike are numbered in key order: "[REDACTED:email] (2)".
+            # alike are numbered in key order: "[REDACTED:email] (2)", the
+            # count going on from the last number given.
+            following: dict[str, int] = {}
             for k in sorted(renamed):
-                masked, fs = self.mask(k)
-                key, i = masked, 2
+                masked, found = renamed[k]
+                key, i = masked, max(following.get(masked, 2), 2)
                 while key in obj:
                     key, i = f"{masked} ({i})", i + 1
+                following[masked] = i
                 obj[key] = obj.pop(k)
-                n[0] += len(fs)
+                n[0] += found
             return obj
         if isinstance(v, list):
             items = cast("list[object]", v)
@@ -668,8 +742,8 @@ class Redactor:
                 items[i] = self._walk(item, n)
             return items
         if isinstance(v, str):
-            masked, fs = self.mask(v)
-            n[0] += len(fs)
+            masked, found = self.mask_or_filter(v)
+            n[0] += found
             return masked
         return v
 

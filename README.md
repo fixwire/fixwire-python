@@ -92,6 +92,18 @@ carry the trace (W3C `traceparent` and `tracestate`, and the incoming
 Celery tasks continue their caller's trace and keep its sampling decision,
 so a trace mixing Fixwire and OpenTelemetry services stays whole.
 
+Targets are matched against the URL without its user info, query and
+fragment:
+
+```python
+fixwire.init(dsn=..., trace_propagation_targets=[
+    "internal.example",                # this host and its subdomains (not badinternal.example)
+    "billing.example:8443",            # a host on one port
+    "https://api.partner.example/v2",  # URLs starting with this
+    re.compile(r"^https://[a-z]+\.svc\.cluster\.local/"),  # searched for in the URL
+])
+```
+
 Each request or task gets its own scope. Request headers come from an
 allowlist: cookies and authorization never leave.
 

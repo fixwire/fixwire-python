@@ -65,6 +65,12 @@ BEGIN = "-----BEGIN "  # split, so no scanner sees a whole key
         "x://u:" * 20_000,
         "eyJ-" * 50_000,
         "a@b.co " * 20_000,
+        "token" + " " * 100_000,
+        "password=" + " " * 100_000 + "x",
+        "sessid" * 50_000,
+        "?code" * 50_000,
+        "secret_key\t" * 30_000,
+        "token: abc " * 30_000,
     ],
     # Short names: pytest puts a test's name in the environment, which Windows caps at 32 KB.
     ids=[
@@ -73,12 +79,39 @@ BEGIN = "-----BEGIN "  # split, so no scanner sees a whole key
         "credentials that never end",
         "tokens that never end",
         "many findings",
+        "a name and spaces",
+        "a name, = and spaces",
+        "names back to back",
+        "codes back to back",
+        "names and tabs",
+        "short values",
     ],
 )
 def test_hostile_text_is_masked_in_linear_time(text: str) -> None:
     started = time.perf_counter()
     Redactor().mask(text)
     assert time.perf_counter() - started < 0.5
+
+
+def test_keys_that_mask_alike_are_numbered_in_linear_time() -> None:
+    doc = {"user%d@example.com" % i: i for i in range(5_000)}
+    started = time.perf_counter()
+    out, count = Redactor().walk(doc)
+    assert time.perf_counter() - started < 1.0
+    assert count == 5_000 and "[REDACTED:email]" in out and "[REDACTED:email] (5000)" in out
+
+
+def test_a_string_redaction_fails_on_is_filtered(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = Redactor.mask
+
+    def mask(self: Redactor, s: str):
+        if "boom" in s:
+            raise RuntimeError("redaction failed")
+        return real(self, s)
+
+    monkeypatch.setattr(Redactor, "mask", mask)
+    out, count = Redactor().walk({"boom key": "kept", "note": "boom ada@example.com", "fine": "ada@example.com"})
+    assert out == {"[Filtered]": "kept", "note": "[Filtered]", "fine": "[REDACTED:email]"} and count == 3
 
 
 def test_tokens_are_found_where_the_servers_expression_finds_them() -> None:

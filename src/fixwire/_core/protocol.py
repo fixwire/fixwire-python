@@ -10,8 +10,8 @@ attributes are key-value lists, ids are hex and 64-bit integers strings.
 from __future__ import annotations
 
 import gzip
+import itertools
 import json
-import math
 import os
 import re
 import time
@@ -20,6 +20,8 @@ from typing import Any, cast
 
 from fixwire._core.dsn import SDK_NAME
 from fixwire._core.jsonish import as_dict, as_list, dicts, get_dict
+from fixwire._core.serializer import number
+from fixwire._core.tracing import MAX_ATTRIBUTES
 from fixwire._version import __version__
 
 #: The endpoints, relative to the DSN's base URL.
@@ -106,7 +108,8 @@ def any_value(value: object) -> dict[str, Any]:
     if isinstance(value, int):
         return {"intValue": str(value)} if -_INT64 <= value < _INT64 else {"stringValue": str(value)}
     if isinstance(value, float):
-        return {"doubleValue": value} if math.isfinite(value) else {"stringValue": str(value)}
+        n = number(value)  # NaN and the infinities as "NaN", "Infinity" and "-Infinity"
+        return {"doubleValue": n} if isinstance(n, float) else {"stringValue": n}
     if isinstance(value, str):
         return {"stringValue": value}
     if value is None:
@@ -269,12 +272,14 @@ def span_kind(op: str | None) -> int:
 
 
 def span(record: dict[str, Any]) -> dict[str, Any]:
-    """A span record (``Span.to_json()``, redacted) as an OTLP span."""
-    attrs = dict(record["attributes"])
+    """A span record (``Span.to_json()``, redacted) as an OTLP span, with
+    MAX_ATTRIBUTES attributes at most (the SDK's own included)."""
     op = record.get("op")
-    if op:
-        attrs["fixwire.op"] = op
-    attrs["fixwire.origin"] = record.get("origin")
+    own = {"fixwire.op": op or None, "fixwire.origin": record.get("origin")}
+    room = MAX_ATTRIBUTES - sum(v is not None for v in own.values())
+    given = ((k, v) for k, v in record["attributes"].items() if k not in own and v is not None)
+    attrs = dict(itertools.islice(given, room))
+    attrs.update(own)
     flags = SAMPLED | HAS_IS_REMOTE | (IS_REMOTE if record.get("parent_remote") else 0)
     out: dict[str, Any] = {
         "traceId": record["trace_id"],

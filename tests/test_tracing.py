@@ -1,9 +1,19 @@
 """Tracing: span trees, sampling, propagation, and the integrations' spans."""
 
+import re
+
 import pytest
 
 import fixwire
-from fixwire._core.tracing import MAX_BAGGAGE, PropagationContext, keep, sample_rand
+from fixwire._core.tracing import (
+    MAX_ATTRIBUTES,
+    MAX_BAGGAGE,
+    MAX_TRACESTATE,
+    PropagationContext,
+    keep,
+    propagates_to,
+    sample_rand,
+)
 
 TRACE, PARENT = "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7"
 
@@ -119,11 +129,76 @@ def test_continuing_and_propagating_traces(ingest):
     assert ingest.events()[0]["contexts"]["trace"]["trace_id"] == TRACE
 
 
-def test_incoming_baggage_is_passed_on_within_the_w3c_limit():
-    members = ",".join("k%d=%s" % (i, "v" * 90) for i in range(200))  # 19 KB from a caller
-    ctx = PropagationContext.from_headers({"baggage": members})
-    assert 0 < len(ctx.baggage) <= MAX_BAGGAGE and members.startswith(ctx.baggage + ","), "whole members"
-    assert PropagationContext.from_headers({"baggage": "a=1,b=2"}).baggage == "a=1,b=2"
+def test_incoming_tracestate_and_baggage_pass_on_whole_or_not_at_all():
+    parent = "00-%s-%s-01" % (TRACE, PARENT)
+
+    def incoming(tracestate="", baggage=""):
+        ctx = PropagationContext.from_headers({"traceparent": parent, "tracestate": tracestate, "baggage": baggage})
+        return ctx.tracestate, ctx.baggage
+
+    state = "v=" + "x" * (MAX_TRACESTATE - 2)
+    assert incoming(state) == (state, "") and incoming(state + "x") == ("", "")
+    members = ",".join("k%d=%s" % (i, "v" * 90) for i in range(200))[: MAX_BAGGAGE - 1]
+    assert incoming(baggage=members + "é")[1] == "", "8,193 bytes (é is two)"
+    assert incoming(baggage=members + "e")[1] == members + "e", "8,192 bytes"
+    assert incoming(baggage="a=1,\tb=2") == ("", "a=1,\tb=2")
+    for broken in ("a=1\r\nx-injected: 1", "a=1\x00", "a=\x7f", "a=\x85"):
+        assert incoming(broken, broken) == ("", ""), repr(broken)
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "00-%s-%s-01" % (TRACE.upper(), PARENT),
+        "01-%s-%s-01" % (TRACE, PARENT),
+        "00-%s-%s-01" % (TRACE, "0" * 16),
+        "00-%s-%s-1" % (TRACE, PARENT),
+        "00-%s-%s-01-extra" % (TRACE, PARENT),
+        "00-%s-%s-01\n" % (TRACE, PARENT),
+        "00-%s0-%s-01" % (TRACE, PARENT),
+    ],
+)
+def test_a_malformed_traceparent_starts_a_new_trace(header):
+    ctx = PropagationContext.from_headers({"traceparent": header, "tracestate": "a=1"})
+    assert not ctx.continued and ctx.trace_id != TRACE and ctx.tracestate == ""
+
+
+@pytest.mark.parametrize(
+    ("target", "url", "matches"),
+    [
+        ("example.com", "https://example.com/x", True),
+        ("example.com", "https://api.example.com/x", True),
+        ("example.com", "https://API.Example.COM:8443/x", True),
+        ("example.com", "https://badexample.com/x", False),
+        ("example.com", "https://example.com.evil.net/x", False),
+        ("example.com", "https://evil.net/?next=https://example.com", False),
+        ("example.com", "https://example.com@evil.net/", False),
+        ("example.com", "https://evil.net/#example.com", False),
+        ("Example.COM", "https://api.example.com/x", True),
+        ("example.com:8443", "https://api.example.com:8443/x", True),
+        ("example.com:8443", "https://example.com/x", False),
+        ("example.com:443", "https://example.com/x", True),
+        ("[::1]:8080", "http://[::1]:8080/x", True),
+        ("https://api.example.com/v2", "https://api.example.com/v2/orders?id=1", True),
+        ("https://api.example.com/v2", "https://user:pw@API.example.com/v2/orders", True),
+        ("https://api.example.com/v2", "https://api.example.com/v1/orders", False),
+        ("https://api.example.com/v2", "http://api.example.com/v2/orders", False),
+        ("https://api.example.com/v2", "https://evil.net/?u=https://api.example.com/v2", False),
+        ("/api", "https://example.com/api/x", False),  # a page's own origin: a server has none
+        ("/api", "/api/x", True),
+        ("", "https://example.com/", False),
+    ],
+)
+def test_propagation_targets(target, url, matches):
+    assert propagates_to([target], url) is matches
+
+
+def test_propagation_target_regexes_see_the_url_without_query_or_user_info():
+    targets = [re.compile(r"^https://[a-z]+\.internal\.example/"), re.compile(r"token")]
+    assert propagates_to(targets, "https://api.internal.example/x")
+    assert not propagates_to(targets, "https://evil.net/?token=1")
+    assert not propagates_to(targets, "https://token:pw@evil.net/x#token")
+    assert not propagates_to(targets, "https://example.com:bad/")
 
 
 def test_an_attribute_whose_str_raises_neither_breaks_the_app_nor_loses_the_segment(ingest):
@@ -355,3 +430,64 @@ def test_big_segments_are_split_under_the_request_limit(ingest, monkeypatch):
     traces = [r for r in ingest.requests if r["path"] == "/v1/traces"]
     assert len(traces) > 1 and all(len(r["body"]) <= 4000 for r in traces)
     assert len(span_items(ingest)) == 31
+
+
+def test_a_request_holds_100_spans_at_most_and_a_span_too_big_goes_alone(ingest, monkeypatch):
+    from fixwire._core import pipeline
+
+    fixwire.init(ingest.dsn, traces_sample_rate=1.0, default_integrations=False)
+    with fixwire.start_span("import"):
+        for i in range(250):
+            with fixwire.start_span("row %d" % i):
+                pass
+    assert fixwire.flush(5)
+    batches = [
+        [s for rs in b["resourceSpans"] for ss in rs["scopeSpans"] for s in ss["spans"]]
+        for b in ingest.bodies("/v1/traces")
+    ]
+    assert [len(spans) for spans in batches] == [100, 100, 51]
+    ingest.requests.clear()
+    monkeypatch.setattr(pipeline, "MAX_SPANS_BYTES", 6000)
+    fixwire.init(ingest.dsn, traces_sample_rate=1.0, default_integrations=False, max_value_length=10_000)
+    with fixwire.start_span("import"):
+        with fixwire.start_span("huge", attributes={"payload": "x" * 8000}):
+            pass
+        with fixwire.start_span("small"):
+            pass
+    assert fixwire.flush(5)
+    assert sorted(s["name"] for s in span_items(ingest)) == ["import", "small"]
+
+
+def test_span_strings_are_redacted_then_cut(ingest):
+    from fixwire import ai
+
+    fixwire.init(ingest.dsn, traces_sample_rate=1.0, default_integrations=False, record_ai_content=True)
+    with fixwire.start_span("charge ada@example.com", op="db.query password=hunter2hunter2") as span:
+        span.set_attribute("db.statement", "é" * 600)  # 1,200 bytes
+        span.set_attribute("ada@example.com", "x" * 900 + " token=" + "s" * 500)
+        span.set_attribute("ratio", float("nan"))
+        with ai.chat("anthropic", "claude-opus-5-5", input="y" * 20_000):
+            pass
+    assert fixwire.flush(5)
+    [(seg, _), (chat, _)] = ingest.otlp_spans()
+    a = {kv["key"]: kv["value"] for kv in seg["attributes"]}
+    assert seg["name"] == "charge [REDACTED:email]"
+    assert a["fixwire.op"] == {"stringValue": "db.query password=[REDACTED:secret_assignment]"}
+    assert a["db.statement"]["stringValue"] == "é" * 510 + "..."
+    assert a["[REDACTED:email]"]["stringValue"] == "x" * 900 + " token=[REDACTED:secret_assignment]"
+    assert a["ratio"] == {"stringValue": "NaN"}
+    content = {kv["key"]: kv["value"] for kv in chat["attributes"]}["gen_ai.input.messages"]["stringValue"]
+    assert content == "y" * (ai.MAX_AI_CONTENT - 3) + "...", "recorded AI content keeps 16 kB"
+
+
+def test_a_span_keeps_128_attributes(ingest):
+    fixwire.init(ingest.dsn, traces_sample_rate=1.0, default_integrations=False)
+    with fixwire.start_span("busy", attributes={"a%d" % i: i for i in range(100)}) as span:
+        for i in range(100, 200):
+            span.set_attribute("a%d" % i, i)
+        span.set_attribute("a0", "changed")  # one it has may change
+    assert len(span.attributes) == MAX_ATTRIBUTES and span.attributes["a0"] == "changed"
+    assert fixwire.flush(5)
+    [(raw, _)] = ingest.otlp_spans()
+    keys = [a["key"] for a in raw["attributes"]]
+    assert len(keys) == MAX_ATTRIBUTES and keys[-1] == "fixwire.origin", "the SDK's own included"

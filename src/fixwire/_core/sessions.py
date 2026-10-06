@@ -14,9 +14,11 @@ from typing import Any
 
 #: Seconds between sends of request sessions while running.
 INTERVAL = 60.0
-#: Minutes and users counted apart until a send; past it, requests count
-#: without their user, so a send stays under the ingest's 1 MB.
-MAX_BUCKETS = 5000
+#: Users counted apart until a send; past it, requests count without their
+#: user, so a send stays under the ingest's 1 MB.
+MAX_USERS = 5000
+#: Aggregates per /v1/sessions request.
+MAX_AGGREGATES = 5000
 
 _COLUMNS = {"ok": 0, "errored": 1, "crashed": 2}
 
@@ -53,6 +55,7 @@ class Aggregates:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._buckets: dict[tuple[int, str | None], list[int]] = {}
+        self._users: set[str] = set()
         self._since: float | None = None
         self._due = False
 
@@ -65,11 +68,14 @@ class Aggregates:
 
     def record(self, status: str, user: str | None, at: float) -> bool:
         """Counts one request; True the first time a send is due."""
-        key = (int(at // 60) * 60, hash_identity(user))
+        did = hash_identity(user)
         with self._lock:
-            if key not in self._buckets and len(self._buckets) >= MAX_BUCKETS:
-                key = (key[0], None)  # counted, without its user
-            self._buckets.setdefault(key, [0, 0, 0])[_COLUMNS.get(status, 0)] += 1
+            if did is not None and did not in self._users:
+                if len(self._users) >= MAX_USERS:
+                    did = None  # counted, without its user
+                else:
+                    self._users.add(did)
+            self._buckets.setdefault((int(at // 60) * 60, did), [0, 0, 0])[_COLUMNS.get(status, 0)] += 1
             if self._since is None:
                 self._since = at
             if not self._due and at - self._since >= INTERVAL:
@@ -81,6 +87,7 @@ class Aggregates:
         """Empties the counts into the ``aggregates`` of a /v1/sessions body."""
         with self._lock:
             buckets, self._buckets = self._buckets, {}
+            self._users = set()
             self._since, self._due = None, False
         if not buckets:
             return None

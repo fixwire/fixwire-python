@@ -42,8 +42,12 @@ class Options:
     traces_sample_rate: float | None = None
     #: A function deciding per trace: (context dict) → rate or bool.
     traces_sampler: TracesSampler | None = None
-    #: Outgoing requests to these hosts or URL prefixes (strings, or regexes)
-    #: carry trace headers. Empty (the default): no headers leave the app.
+    #: Outgoing requests these match carry trace headers, the URL compared
+    #: without its user info, query and fragment: a string with "://" is a
+    #: URL prefix ("https://api.example.com/v2"), any other a host, with a
+    #: port if it has one, matching it and its subdomains ("example.com":
+    #: api.example.com, not badexample.com); a regex is searched for in the
+    #: URL. Empty (the default): no headers leave the app.
     trace_propagation_targets: list[str | re.Pattern[str]] = field(default_factory=list[str | re.Pattern[str]])
     max_breadcrumbs: int = 100
     before_send: BeforeSend | None = None
@@ -51,7 +55,8 @@ class Options:
     #: Local variables of in-app frames, bounded and redacted.
     include_local_variables: bool = True
     include_source_context: bool = True
-    #: Longest string kept in an event.
+    #: Longest string sent, in bytes of UTF-8: longer ones are cut on a
+    #: character boundary and end in "..." (redaction reads 16 kB past the cut).
     max_value_length: int = 1024
     #: Stack frames kept per exception (the oldest are dropped first).
     max_stack_frames: int = 100
@@ -72,8 +77,9 @@ class Options:
     shutdown_timeout: float = 2.0
     #: Seconds per HTTP request.
     http_timeout: float = 10.0
-    #: Events waiting to be sent; past it the oldest are dropped.
-    max_queue_size: int = 1000
+    #: Requests waiting to be sent, and as many waiting for a retry; past
+    #: it new data is dropped.
+    max_queue_size: int = 100
     #: Keep requests on disk until sent, across outages and restarts:
     #: True (a cache directory per DSN) or a file path. Off by default.
     offline: bool | str = False

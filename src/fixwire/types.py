@@ -218,7 +218,8 @@ class ClientOptions(TypedDict, total=False):
     """Share of traces recorded, 0.0–1.0. None (the default) turns tracing off."""
     traces_sampler: TracesSampler | None
     trace_propagation_targets: list[str | re.Pattern[str]]
-    """Hosts or URL prefixes (strings, or compiled regexes) that receive trace headers. Empty: none."""
+    """Where trace headers go, matched against the URL without user info, query and fragment: a URL prefix
+    (a string with "://"), a host (and port) with its subdomains, or a compiled regex searched for. Empty: nowhere."""
     max_breadcrumbs: int
     before_send: BeforeSend | None
     before_breadcrumb: BeforeBreadcrumb | None
@@ -226,7 +227,7 @@ class ClientOptions(TypedDict, total=False):
     """Local variables of in-app frames, bounded and redacted (default True)."""
     include_source_context: bool
     max_value_length: int
-    """Longest string kept in an event (default 1024)."""
+    """Longest string sent, in bytes of UTF-8, "..." included (default 1024)."""
     max_stack_frames: int
     in_app_include: list[str]
     in_app_exclude: list[str]
@@ -241,6 +242,7 @@ class ClientOptions(TypedDict, total=False):
     shutdown_timeout: float
     http_timeout: float
     max_queue_size: int
+    """Requests waiting to be sent, and as many waiting for a retry (default 100); past it new data is dropped."""
     offline: bool | str
     """Keep requests on disk until sent: True (a cache directory) or a file path. Off by default."""
     default_integrations: bool

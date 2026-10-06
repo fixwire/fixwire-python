@@ -3,13 +3,15 @@ cheap work:
 
   caller:  build → scopes → fingerprint → budgets ─► drop
                  → sample_rate ─► drop → processors → before_send → queue
-  driver:  source context → serialize → REDACT → OTLP log record
-           → size guard → gzip → a /v1/logs request
+  driver:  source context → serialize → REDACT → cut strings → OTLP log
+           record → size guard → gzip → a /v1/logs request
 
 Dropped events never pay for serialization or redaction, and redaction runs
-after before_send, so nothing a callback adds escapes it. Spans, sessions,
-check-ins and feedback are queued the same way and become their own
-requests (sdks/PROTOCOL.md).
+after before_send, so nothing a callback adds escapes it. It reads each
+string's part kept and the next 16 kB before the cut to max_value_length, so
+a secret the cut goes through is still found. Spans, sessions, check-ins and
+feedback are queued the same way and become their own requests
+(sdks/PROTOCOL.md).
 """
 
 from __future__ import annotations
@@ -28,11 +30,13 @@ from urllib.parse import quote
 from fixwire._core import event_builder, protocol, scope
 from fixwire._core.delivery import Outbound
 from fixwire._core.dsn import SDK_NAME, Dsn
+from fixwire._core.jsonish import get_dict
 from fixwire._core.limiter import Limiter, fingerprint
 from fixwire._core.options import Options
 from fixwire._core.redact import Redactor
-from fixwire._core.serializer import Serializer
-from fixwire._core.sessions import Aggregates
+from fixwire._core.serializer import Serializer, clip, clip_strings, window
+from fixwire._core.sessions import MAX_AGGREGATES, Aggregates
+from fixwire._core.tracing import AI_CONTENT, MAX_AI_CONTENT
 from fixwire._version import __version__
 
 if TYPE_CHECKING:
@@ -50,8 +54,9 @@ logger = logging.getLogger("fixwire")
 
 #: The ingest's limit for one error or message.
 MAX_EVENT_BYTES = 1 << 20
-#: The ingest's limit for one request of spans.
+#: The ingest's limits for one request of spans.
 MAX_SPANS_BYTES = 5 << 20
+MAX_SPANS_PER_REQUEST = 100
 
 #: Marks a queued item that isn't an event: "spans", "sessions",
 #: "feedback" or "check_in".
@@ -73,7 +78,7 @@ _FEEDBACK_SKIP = ("sdk", "feedback_id", "timestamp", "event_id", "trace_id", "re
 
 
 class EventQueue:
-    """Thread-safe and never blocks: past max_size the oldest events go."""
+    """Thread-safe and never blocks: past max_size new events are dropped."""
 
     def __init__(self, max_size: int) -> None:
         self._items: deque[dict[str, Any]] = deque()
@@ -81,12 +86,14 @@ class EventQueue:
         self._lock = threading.Lock()
         self.overflowed = 0
 
-    def put(self, event: dict[str, Any]) -> None:
+    def put(self, event: dict[str, Any]) -> bool:
+        """Queues an event; False when the queue is full and it is dropped."""
         with self._lock:
             if len(self._items) >= self._max:
-                self._items.popleft()
                 self.overflowed += 1
+                return False
             self._items.append(event)
+            return True
 
     def drain(self) -> list[Any]:
         with self._lock:
@@ -114,7 +121,9 @@ class Core:
             in_app_exclude=options.in_app_exclude,
             project_root=options.project_root,
         )
-        self.serializer = Serializer(options.max_value_length)
+        # Strings are serialized to what redaction reads, and cut once redacted.
+        self.serializer = Serializer(window(options.max_value_length))
+        self.ai_serializer = Serializer(window(MAX_AI_CONTENT))
         self.redactor = Redactor(sensitive_keys=options.sensitive_keys) if options.redact else None
         rl = options.rate_limit
         self.limiter = Limiter(rl.per_issue_burst, rl.per_issue_per_minute, rl.global_per_minute, rl.enabled)
@@ -360,7 +369,13 @@ class Core:
     def _encode_event(self, event: dict[str, Any]) -> Outbound | None:
         if self.options.include_source_context:
             event_builder.add_source_context(event, self.options.max_value_length)
-        data = self._redact(self.serializer(event), _REDACT_SKIP)
+        # Each field is a value of its own for the serializer's limits.
+        data = {str(k): self.serializer(v, 1) for k, v in event.items()}
+        request = get_dict(data.get("request"))
+        if request.get("url") and request.get("query_string"):
+            # The query is redacted as part of its URL, as the server reads it ("?code=…").
+            request["url"] = "%s?%s" % (request["url"], request.pop("query_string"))
+        data = clip_strings(self._redact(data, _REDACT_SKIP), self.options.max_value_length)
         res = protocol.resource(
             self.service,
             data.get("release") or None,
@@ -384,28 +399,55 @@ class Core:
         """A finished segment as a queue item; encoded by the driver."""
         return {_KIND: "spans", "spans": [s.to_json() for s in segment.spans()]}
 
-    def _encode_spans(self, records: list[dict[str, Any]]) -> Iterator[Outbound]:
+    def _string(self, s: str, limit: int) -> str:
+        """A string as sent: redacted over the part kept and the next 16 kB,
+        then cut to ``limit``."""
+        s = clip(s, window(limit))
         if self.redactor is not None:
-            for s in records:
-                # Attribute values (URLs, queries, messages) and names.
-                self.redactor.walk(s["attributes"])
-                s["name"], _ = self.redactor.mask(s["name"])
+            s, _ = self.redactor.mask_or_filter(s)
+        return clip(s, limit)
+
+    def _bound_span(self, record: dict[str, Any]) -> None:
+        """A span's strings as an event's (redacted, then cut); recorded AI
+        content keeps MAX_AI_CONTENT."""
+        limit = self.options.max_value_length
+        record["name"] = self._string(record["name"], limit)
+        for key in ("op", "origin"):
+            if isinstance(record.get(key), str):
+                record[key] = self._string(record[key], limit)
+        attrs = {
+            k: (self.ai_serializer if k in AI_CONTENT else self.serializer)(v, 1)
+            for k, v in record["attributes"].items()
+        }
+        if self.redactor is not None:
+            # Attribute values (URLs, queries, messages) and names.
+            attrs, _ = self.redactor.walk(attrs)
+        record["attributes"] = {
+            clip(k, limit): clip_strings(v, MAX_AI_CONTENT if k in AI_CONTENT else limit) for k, v in attrs.items()
+        }
+
+    def _encode_spans(self, records: list[dict[str, Any]]) -> Iterator[Outbound]:
+        for s in records:
+            self._bound_span(s)
         o = self.options
         res = protocol.resource(self.service, o.release, o.environment, o.server_name)
         spans = [protocol.span(s) for s in records]
-        body = protocol.dumps(protocol.traces(res, spans))
-        if len(body) <= MAX_SPANS_BYTES:
-            yield self._request(protocol.TRACES, body, "span")
-            return
-        # Too much for one request: in batches under the limit.
+        if len(spans) <= MAX_SPANS_PER_REQUEST:
+            body = protocol.dumps(protocol.traces(res, spans))
+            if len(body) <= MAX_SPANS_BYTES:
+                yield self._request(protocol.TRACES, body, "span")
+                return
+        # Too much for one request: in batches within the limits; a span
+        # that can't fit in one alone is dropped alone.
+        room = MAX_SPANS_BYTES - len(protocol.dumps(protocol.traces(res, [])))
         batch: list[dict[str, Any]] = []
         size = 0
         for s in spans:
-            n = len(protocol.dumps(s)) + 1
-            if n > MAX_SPANS_BYTES // 2:
+            n = len(protocol.dumps(s)) + 1  # and a comma
+            if n > room:
                 self._drop("span too large")
                 continue
-            if batch and size + n > MAX_SPANS_BYTES // 2:
+            if batch and (len(batch) >= MAX_SPANS_PER_REQUEST or size + n > room):
                 yield self._request(protocol.TRACES, protocol.dumps(protocol.traces(res, batch)), "span")
                 batch, size = [], 0
             batch.append(s)
@@ -417,29 +459,39 @@ class Core:
         aggregates = self.sessions.take()
         if aggregates is None:
             return []
-        body = {
-            "sdk": protocol.sdk(),
-            "release": self.options.release or "",
-            "environment": self.options.environment or "production",
-            "aggregates": aggregates,
-        }
-        return [self._request(protocol.SESSIONS, protocol.dumps(body), "session")]
+        out: list[Outbound] = []
+        for i in range(0, len(aggregates), MAX_AGGREGATES):
+            body = {
+                "sdk": protocol.sdk(),
+                "release": self.options.release or "",
+                "environment": self.options.environment or "production",
+                "aggregates": aggregates[i : i + MAX_AGGREGATES],
+            }
+            out.append(self._request(protocol.SESSIONS, protocol.dumps(body), "session"))
+        return out
 
     @staticmethod
     def _shrink(data: dict[str, Any], encode: Callable[[dict[str, Any]], bytes]) -> bytes | None:
-        """Drops the bulkiest optional parts until the event fits."""
-        data.pop("breadcrumbs", None)
-        for frame in event_builder.iter_event_frames(data):
-            frame.pop("vars", None)
-        body = encode(data)
-        if len(body) <= MAX_EVENT_BYTES:
-            return body
-        for frame in event_builder.iter_event_frames(data):
-            for key in ("pre_context", "post_context", "context_line"):
-                frame.pop(key, None)
-        data.pop("extra", None)
-        body = encode(data)
-        return body if len(body) <= MAX_EVENT_BYTES else None
+        """Leaves out the breadcrumbs, then the frames' local variables,
+        then the contexts (the trace stays), until the record fits; None
+        when it never does."""
+
+        def drop_vars() -> None:
+            for frame in event_builder.iter_event_frames(data):
+                frame.pop("vars", None)
+
+        def drop_contexts() -> None:
+            contexts = data.get("contexts")
+            if isinstance(contexts, dict):
+                kept = cast("dict[str, Any]", contexts)
+                data["contexts"] = {k: kept[k] for k in ("trace", "fixwire") if k in kept}
+
+        for shed in (lambda: data.pop("breadcrumbs", None), drop_vars, drop_contexts):
+            shed()
+            body = encode(data)
+            if len(body) <= MAX_EVENT_BYTES:
+                return body
+        return None
 
     # The offline spool. Called from the driver only.
 

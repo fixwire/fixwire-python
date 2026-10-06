@@ -6,7 +6,9 @@ import re
 import pytest
 
 import fixwire
-from fixwire._core.sessions import MAX_BUCKETS, Aggregates, hash_identity
+from fixwire._core.pipeline import Core
+from fixwire._core.protocol import dumps
+from fixwire._core.sessions import MAX_AGGREGATES, MAX_USERS, Aggregates, hash_identity
 from fixwire.integrations.wsgi import FixwireMiddleware
 
 
@@ -125,8 +127,31 @@ def test_aggregates_send_once_a_minute():
 
 def test_aggregates_count_a_bounded_number_of_users_apart():
     agg = Aggregates()
-    for i in range(MAX_BUCKETS + 100):
+    for i in range(MAX_USERS + 100):
         agg.record("ok", "user-%d" % i, 1000.0)
+    agg.record("ok", "user-0", 1000.0)  # one of the users counted apart: still apart
     aggregates = agg.take()
-    assert aggregates is not None and len(aggregates) == MAX_BUCKETS + 1, "the rest without a user"
-    assert sum(a["exited"] for a in aggregates) == MAX_BUCKETS + 100, "every request still counts"
+    assert aggregates is not None and len(aggregates) == MAX_USERS + 1, "the rest without a user"
+    assert sum(a["exited"] for a in aggregates) == MAX_USERS + 101, "every request still counts"
+    assert [a["exited"] for a in aggregates if a.get("did") == hash_identity("user-0")] == [2]
+    # The users apart are counted per send.
+    agg.record("ok", "someone else", 1000.0)
+    assert agg.take() == [{"started": "1970-01-01T00:16:00Z", "did": hash_identity("someone else"), "exited": 1}]
+
+
+def test_a_sessions_request_holds_a_bounded_number_of_aggregates():
+    import gzip
+    import json
+
+    from fixwire._core.options import Options
+
+    core = Core(Options(dsn="https://k@ingest.example", release="api@1"))
+    for minute in range(3):  # the same users in three minutes: an aggregate per user and minute
+        for i in range(MAX_USERS):
+            core.sessions.record("ok", "user-%d" % i, 60.0 * minute)
+    core.sessions.record("ok", None, 180.0)
+    requests = core.encode(core.sessions_item())
+    bodies = [json.loads(gzip.decompress(r.body)) for r in requests]
+    assert [len(b["aggregates"]) for b in bodies] == [MAX_AGGREGATES] * 3 + [1]
+    assert sum(a["exited"] for b in bodies for a in b["aggregates"]) == 3 * MAX_USERS + 1
+    assert all(len(dumps(b)) < 1 << 20 for b in bodies)

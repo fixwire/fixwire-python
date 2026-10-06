@@ -9,7 +9,7 @@ headers. A continued trace keeps its caller's decision (the sampled flag); a
 new one decides from its trace id's random part (its last 56 bits), as
 OpenTelemetry's consistent probability sampling does, so every service of a
 trace keeps or drops it alike. The caller's ``tracestate`` and ``baggage``
-pass on unchanged.
+pass on unchanged, or not at all when too long or broken.
 
 Nothing is registered with OpenTelemetry's globals: an app's own OTel setup
 is never touched.
@@ -18,25 +18,48 @@ is never touched.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import time
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit
 
 from fixwire._core.event_builder import safe_str
 
 if TYPE_CHECKING:
     from fixwire.types import SamplingContext, TracesSampler
 
+logger = logging.getLogger("fixwire")
+
 #: Spans kept per segment; past it they're dropped and counted.
 MAX_SPANS_PER_SEGMENT = 1000
-#: Bytes of incoming baggage passed on (W3C's limit).
+#: Attributes kept per span; past it new ones are dropped.
+MAX_ATTRIBUTES = 128
+#: Bytes of incoming tracestate and baggage passed on (W3C's limits); a
+#: longer header is not passed on at all.
+MAX_TRACESTATE = 512
 MAX_BAGGAGE = 8192
+#: Recorded AI content (record_ai_content): these attributes are kept to
+#: MAX_AI_CONTENT bytes instead of max_value_length.
+MAX_AI_CONTENT = 16_384
+AI_CONTENT = frozenset(
+    {
+        "gen_ai.input.messages",
+        "gen_ai.output.messages",
+        "gen_ai.system_instructions",
+        "gen_ai.tool.call.arguments",
+        "gen_ai.tool.call.result",
+    }
+)
 
-_TRACEPARENT = re.compile(r"^\s*00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})\s*$")
+_TRACEPARENT = re.compile(r"[ \t]*00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})[ \t]*")
+#: Control characters (but tab, which headers allow between members).
+_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]")
+_DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
 
 def new_trace_id() -> str:
@@ -75,25 +98,27 @@ class PropagationContext:
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, Any]) -> PropagationContext:
+        """The trace of incoming headers: continued when ``traceparent`` is
+        well formed (version 00, non-zero ids); ``tracestate`` and
+        ``baggage`` within their limits and without control characters."""
         h = {str(k).lower(): v for k, v in headers.items()}
         ctx = cls()
-        m = _TRACEPARENT.match(_header(h, "traceparent"))
+        m = _TRACEPARENT.fullmatch(_header(h, "traceparent"))
         if m and m.group(1) != "0" * 32 and m.group(2) != "0" * 16:
             ctx.continued = True
             ctx.trace_id, ctx.parent_span_id = m.group(1), m.group(2)
             ctx.sampled = bool(int(m.group(3), 16) & 1)
-            ctx.tracestate = _header(h, "tracestate")
-        ctx.baggage = _cap_baggage(_header(h, "baggage"))
+            ctx.tracestate = _passed_on(_header(h, "tracestate"), MAX_TRACESTATE)
+        ctx.baggage = _passed_on(_header(h, "baggage"), MAX_BAGGAGE)
         return ctx
 
 
-def _cap_baggage(value: str) -> str:
-    """Incoming baggage within W3C's limit (ASCII, so characters are
-    bytes): the members that fit."""
-    if len(value) <= MAX_BAGGAGE:
-        return value
-    cut = value.rfind(",", 0, MAX_BAGGAGE + 1)
-    return value[:cut].rstrip() if cut > 0 else ""
+def _passed_on(value: str, limit: int) -> str:
+    """An incoming header as passed on: whole, or (over ``limit`` bytes or
+    with a control character) not at all."""
+    if len(value.encode("utf-8", "surrogatepass")) > limit or _CONTROL.search(value):
+        return ""
+    return value
 
 
 def _header(headers: dict[str, Any], name: str) -> str:
@@ -101,7 +126,64 @@ def _header(headers: dict[str, Any], name: str) -> str:
     value = headers.get(name)
     if isinstance(value, (list, tuple)):
         return ",".join(str(v) for v in cast("list[object]", value))
-    return str(value).strip() if value else ""
+    return str(value).strip(" \t") if value else ""
+
+
+def _compared(url: str) -> tuple[str, str | None, int | None]:
+    """A URL as trace_propagation_targets see it (without user info, query
+    and fragment, its scheme and host lower case, a default port left out),
+    its host and its port (or the scheme's)."""
+    parts = urlsplit(url)
+    host, port = parts.hostname, parts.port
+    if not parts.netloc or host is None:
+        return parts.path, None, None
+    default = _DEFAULT_PORTS.get(parts.scheme)
+    where = "[%s]" % host if ":" in host else host
+    if port is not None and port != default:
+        where += ":%d" % port
+    prefix = parts.scheme + "://" if parts.scheme else "//"
+    return prefix + where + parts.path, host, port if port is not None else default
+
+
+def _host_target(target: str) -> tuple[str, int | None]:
+    """A host target's host (lower case) and port, if it names one."""
+    host, sep, port = target.rpartition(":")
+    if not sep or not port.isdigit() or (":" in host and not host.endswith("]")):
+        host, port = target, ""  # no port, or a bare IPv6 address
+    return host.strip("[]").lower(), int(port) if port else None
+
+
+def propagates_to(targets: Iterable[str | re.Pattern[str]], url: str) -> bool:
+    """Whether trace headers may go to ``url``: a target with "://" is a URL
+    prefix; one starting with "/" a path, matching relative URLs only (a
+    server sees no page origin); any other a host (and port) matching it
+    and its subdomains; a regex is searched for. Each in the URL compared
+    without its user info, query and fragment."""
+    try:
+        compared, host, port = _compared(url)
+    except ValueError:  # a broken port or IPv6 address
+        return False
+    for t in targets:
+        if isinstance(t, re.Pattern):
+            if t.search(compared):
+                return True
+        elif not t:
+            continue
+        elif "://" in t:
+            try:
+                prefix = _compared(t)[0]
+            except ValueError:
+                continue
+            if compared.startswith(prefix):
+                return True
+        elif t.startswith("/"):
+            if host is None and compared.startswith(t):
+                return True
+        elif host is not None:
+            name, wanted = _host_target(t)
+            if (host == name or host.endswith("." + name)) and wanted in (None, port):
+                return True
+    return False
 
 
 def sample_rand(trace_id: str) -> float:
@@ -169,7 +251,8 @@ class Span:
         self.status = "ok"
         self.start: float = time.time()
         self.end: float | None = None
-        self.attributes: dict[str, Any] = dict(attributes or {})
+        self.attributes: dict[str, Any] = {}
+        self.set_attributes(attributes or {})
         self.segment = segment or self
         self.sampled = sampled
         #: The parent is in another process (the caller of a continued trace).
@@ -191,8 +274,9 @@ class Span:
 
     def set_attribute(self, key: str, value: Any) -> None:
         """An attribute (str, bool, int, float or a list of them; others
-        become strings). None is ignored."""
-        if value is not None:
+        become strings). None is ignored, and so are new keys once the span
+        has MAX_ATTRIBUTES."""
+        if value is not None and (key in self.attributes or len(self.attributes) < MAX_ATTRIBUTES):
             self.attributes[key] = value
 
     def set_attributes(self, values: Mapping[str, Any]) -> None:
@@ -295,6 +379,7 @@ def sample(
             context: SamplingContext = {"name": name, "attributes": dict(attributes), "parent_sampled": ctx.sampled}
             decision = cast("Callable[[SamplingContext], float | bool | None]", sampler)(context)
         except Exception:
+            logger.exception("fixwire: traces_sampler failed; deciding without it")
             decision = None
         if decision is not None:
             return keep(ctx.trace_id, float(decision))

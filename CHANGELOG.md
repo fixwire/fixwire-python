@@ -16,8 +16,19 @@ API.
 - The logging integration ignores records logged while it reports one (before_send, event processors).
 - capture_exception() and finished spans never raise into the app when an exception or attribute breaks on reading.
 - The offline spool is readable by its user only (0600 files, 0700 directory); requests given up on leave it.
-- Incoming baggage is capped at 8192 bytes; sessions count at most 5,000 users apart per send.
 - Message stacks stop at max_stack_frames; local variables and source context stay within their budgets (no FIFOs or files over 10 MB).
+- Redaction follows the server's new secret_assignment rule (names ending a longer one: access_token, client_secret, csrfToken, PHPSESSID, X-Amz-Signature; secret and private keys, credentials, session ids, signatures; an OAuth code in a query or fragment), by a linear scanner; keys that mask alike are numbered in linear time. A query is redacted as part of its URL.
+- A string redaction fails on is sent as "[Filtered]", never unmasked.
+- max_value_length counts UTF-8 bytes, cuts on a character boundary with "..." inside the limit, and applies to span names, ops and attributes too (recorded AI content keeps 16 kB). Redaction runs before the cut, over the part kept and the next 16 kB, so a key or token the cut goes through is masked whole.
+- Values: one level past 10 is "[Object]" or "[Array]", at most 10,000 containers are walked per value, a value that can't be read is "[Unreadable]", and NaN and the infinities are "NaN", "Infinity" and "-Infinity".
+- An exception chain keeps 10 exceptions; source lines come through a bounded cache (64 files, 32 MB).
+- A span keeps 128 attributes; spans go in requests of at most 100; a sessions request holds at most 5,000 aggregates, and sessions count 5,000 users apart per send.
+- An error over 1 MB leaves out its breadcrumbs, then its frames' variables, then its contexts, and is dropped if still over.
+- Retries: at most 3, after about 1, 2 and 4 s; a request whose next try is more than 5 minutes away is dropped. Retry-After may be an HTTP date; a 429 without Fixwire-Rate-Limits pauses all data for at least 60 s, a 5xx with Retry-After for that long; unknown rate-limit categories are ignored.
+- max_queue_size defaults to 100 requests, and as many may wait for a retry; past it new data is dropped (not the oldest).
+- An incoming tracestate over 512 bytes or baggage over 8,192 bytes, or either with a control character, is not passed on at all; traceparent is read strictly.
+- trace_propagation_targets match hosts and their subdomains (not substrings of the URL), URL prefixes, and regexes, against the URL without user info, query and fragment.
+- AsyncClient.flush() and close() keep to their timeout even while the loop is busy; failures in traces_sampler and before_breadcrumb are logged.
 
 ## [0.1.0] - 2026-10-06
 

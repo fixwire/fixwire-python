@@ -9,6 +9,7 @@ or task; they differ in how they deliver:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import math
 import threading
@@ -318,6 +319,7 @@ class AsyncClient(Client):
 
     async def aflush(self, timeout: float | None = None) -> bool:
         timeout = self.options.shutdown_timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
         self._send_sessions()
         ok = True
         if self._async_driver is not None and self._async_driver.usable:
@@ -327,7 +329,7 @@ class AsyncClient(Client):
                 fut = asyncio.run_coroutine_threadsafe(self._async_driver.aflush(timeout), self.loop)
                 ok = await asyncio.wrap_future(fut)
         if self._thread_driver is not None:
-            ok = await asyncio.to_thread(self._thread_driver.flush, timeout) and ok
+            ok = await asyncio.to_thread(self._thread_driver.flush, _left(deadline)) and ok
         return ok
 
     def flush(self, timeout: float | None = None) -> bool:
@@ -337,18 +339,15 @@ class AsyncClient(Client):
         if self._on_loop_thread():
             warnings.warn("AsyncClient.flush() called on its event loop; use `await client.aflush()`", stacklevel=2)
             return False
+        deadline = time.monotonic() + timeout
         self._send_sessions()
         ok = True
         if self._async_driver is not None and self._async_driver.usable and self.loop.is_running():
-            fut = asyncio.run_coroutine_threadsafe(self._async_driver.aflush(timeout), self.loop)
-            try:
-                ok = fut.result(timeout + 1)
-            except Exception:
-                ok = False
+            ok = _wait(asyncio.run_coroutine_threadsafe(self._async_driver.aflush(timeout), self.loop), deadline)
         elif self._async_driver is not None:
             self._hand_over()
         if self._thread_driver is not None:
-            ok = self._thread_driver.flush(timeout) and ok
+            ok = self._thread_driver.flush(_left(deadline)) and ok
         return ok
 
     def _hand_over(self) -> None:
@@ -365,6 +364,7 @@ class AsyncClient(Client):
         if self._closed:
             return
         timeout = self.options.shutdown_timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
         self._send_sessions()
         if self._async_driver is not None and self._async_driver.usable:
             if self._on_loop_thread():
@@ -374,7 +374,7 @@ class AsyncClient(Client):
                     asyncio.run_coroutine_threadsafe(self._async_driver.aclose(timeout), self.loop)
                 )
         if self._thread_driver is not None:
-            await asyncio.to_thread(self._thread_driver.close, timeout)
+            await asyncio.to_thread(self._thread_driver.close, _left(deadline))
         self._closed = True
 
     def close(self, timeout: float | None = None) -> None:
@@ -383,15 +383,27 @@ class AsyncClient(Client):
         if self._on_loop_thread():
             warnings.warn("AsyncClient.close() called on its event loop; use `await client.aclose()`", stacklevel=2)
             return
+        timeout = self.options.shutdown_timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
         self._send_sessions()
         if self._async_driver is not None:
             if self._async_driver.usable and self.loop.is_running():
-                timeout_ = self.options.shutdown_timeout if timeout is None else timeout
-                fut = asyncio.run_coroutine_threadsafe(self._async_driver.aclose(timeout_), self.loop)
-                try:
-                    fut.result(timeout_ + 1)
-                except Exception:
-                    pass
+                _wait(asyncio.run_coroutine_threadsafe(self._async_driver.aclose(timeout), self.loop), deadline)
             else:
                 self._hand_over()
-        super().close(timeout)
+        super().close(_left(deadline))
+
+
+def _left(deadline: float) -> float:
+    """Seconds left until a deadline (time.monotonic())."""
+    return max(0.0, deadline - time.monotonic())
+
+
+def _wait(fut: concurrent.futures.Future[Any], deadline: float) -> bool:
+    """A loop's work's result, waited for until the deadline (then given up
+    on: the caller's timeout holds even when the loop is busy)."""
+    try:
+        return fut.result(_left(deadline)) is not False
+    except Exception:
+        fut.cancel()
+        return False

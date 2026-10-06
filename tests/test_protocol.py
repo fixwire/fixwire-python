@@ -13,7 +13,9 @@ def test_any_value():
     assert protocol.any_value(3) == {"intValue": "3"}
     assert protocol.any_value(1 << 70) == {"stringValue": str(1 << 70)}
     assert protocol.any_value(2.5) == {"doubleValue": 2.5}
-    assert protocol.any_value(float("inf")) == {"stringValue": "inf"}
+    assert protocol.any_value(float("inf")) == {"stringValue": "Infinity"}
+    assert protocol.any_value(float("-inf")) == {"stringValue": "-Infinity"}
+    assert protocol.any_value(float("nan")) == {"stringValue": "NaN"}
     assert protocol.any_value(None) == {}
     assert protocol.any_value({"a": [1, "x"], "b": None}) == {
         "kvlistValue": {

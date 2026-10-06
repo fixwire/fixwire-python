@@ -11,6 +11,7 @@ errors, messages and spans as OTLP/HTTP JSON, the rest as small JSON bodies.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
@@ -75,6 +76,8 @@ __all__ = [
     "ai",
     "serverless_function",
 ]
+
+logger = logging.getLogger("fixwire")
 
 _client: Client | None = None
 _last_event_id: str | None = None
@@ -229,13 +232,18 @@ def add_breadcrumb(
     """Records a step on the way to an error: ``add_breadcrumb(category="cart",
     message="added sku-1")``. Events captured later in this request or job
     carry the latest breadcrumbs."""
-    merged: Breadcrumb = {**(crumb or {}), **fields}
-    merged.setdefault("timestamp", time.time())
+    try:
+        merged: Breadcrumb = {**(crumb or {}), **fields}
+        merged.setdefault("timestamp", time.time())
+    except Exception:  # not a mapping
+        logger.debug("fixwire: dropped a breadcrumb that isn't a dict", exc_info=True)
+        return
     before = _client.options.before_breadcrumb if _client else None
     if before is not None:
         try:
             changed = cast("Callable[[Breadcrumb, dict[str, Any]], Breadcrumb | None]", before)(merged, hint or {})
         except Exception:
+            logger.exception("fixwire: before_breadcrumb failed; keeping the breadcrumb unchanged")
             changed = merged
         if changed is None:
             return
@@ -313,7 +321,11 @@ def continue_trace(headers: Mapping[str, Any]) -> PropagationContext:
     ``tracestate``; ``baggage`` passes on) for the current isolation scope.
     Integrations call it per request; call it yourself for queues or custom
     protocols."""
-    ctx = PropagationContext.from_headers(headers)
+    try:
+        ctx = PropagationContext.from_headers(headers)
+    except Exception:  # headers that can't be read: a trace of our own
+        logger.debug("fixwire: could not read trace headers", exc_info=True)
+        ctx = PropagationContext()
     get_isolation_scope().propagation = ctx
     return ctx
 
@@ -353,17 +365,20 @@ def _merge_baggage(own: str, incoming: str) -> str:
 
 
 def should_propagate(url: str) -> bool:
-    """Whether trace headers may go to url (trace_propagation_targets)."""
-    import re as _re
+    """Whether trace headers may go to url: it matches one of
+    trace_propagation_targets, compared without its user info, query and
+    fragment. A string with "://" is a URL prefix; one starting with "/" a
+    path (of relative URLs); any other a host, with a port if it has one,
+    matching it and its subdomains ("example.com" matches api.example.com,
+    not badexample.com or example.com.evil.net); a regex is searched for."""
+    from fixwire._core.tracing import propagates_to
 
     targets = _client.options.trace_propagation_targets if _client is not None else []
-    for t in targets:
-        if isinstance(t, _re.Pattern):
-            if t.search(url):
-                return True
-        elif t in url:
-            return True
-    return False
+    try:
+        return bool(targets) and propagates_to(targets, url)
+    except Exception:
+        logger.debug("fixwire: could not match trace_propagation_targets", exc_info=True)
+        return False
 
 
 # AI agent tracing (fixwire.ai.agent, .chat, .tool, wrap_anthropic, wrap_openai): last, as it uses the API above.

@@ -24,7 +24,7 @@ class ThreadDriver:
     def __init__(self, core: Core, send: Callable[[str, bytes, dict[str, str]], tuple[int, dict[str, str]]]) -> None:
         self.core = core
         self.send = send
-        self.delivery = Delivery()
+        self.delivery = Delivery(max_items=core.options.max_queue_size)
         self._cond = threading.Condition()
         self._thread: threading.Thread | None = None
         self._stopping = False
@@ -171,7 +171,7 @@ class ThreadDriver:
         # A lock another thread held at the fork stays held in the child:
         # the core's are made anew (the queue empty: the parent sends it).
         self.core.after_fork()
-        self.delivery = Delivery()
+        self.delivery = Delivery(max_items=self.core.options.max_queue_size)
         reset = getattr(self.send, "after_fork", None)
         if reset:
             reset()

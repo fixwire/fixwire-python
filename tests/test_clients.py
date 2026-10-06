@@ -257,6 +257,156 @@ def test_an_exception_that_breaks_when_read_is_not_raised_into_the_app(ingest):
             assert client.capture_exception() is None
 
 
+BEGIN = "-----BEGIN "  # split, so no scanner sees a whole key
+KEY = BEGIN + "RSA PRIVATE KEY-----\n" + "MIIEowIBAAKCAQEA" * 120 + "\n-----END RSA PRIVATE KEY-----"
+JWT = "eyJhbGciOiJIUzI1NiJ9.eyJ" + "c3ViIjoiYWRhIn0" * 200 + ".c2lnbmF0dXJlLXNpZ25hdHVyZQ"
+
+
+def _hold(secret):
+    held = "q" * 900 + " " + secret  # noqa: F841 - a local the cut goes through
+    raise ValueError("held")
+
+
+def test_strings_are_redacted_then_cut_in_bytes(ingest):
+    with Client(ingest.dsn, default_integrations=False) as client:
+        fixwire.set_extra("fits", "é" * 512)  # 1,024 bytes
+        fixwire.set_extra("over", "é" * 512 + "a")  # 1,025 bytes
+        # Secrets the cut at 1,024 bytes goes through: masked whole.
+        fixwire.set_extra("key", "x" * 100 + KEY)
+        fixwire.set_extra("jwt", "y" * 600 + " " + JWT)
+        try:
+            _hold(JWT)
+        except ValueError:
+            client.capture_exception()
+        assert client.flush(5)
+    [(record, _)] = ingest.records()
+    a = record["attributes"]
+    assert a["fits"] == "é" * 512
+    assert a["over"] == "é" * 510 + "..." and len(a["over"].encode()) == 1023
+    assert a["key"] == "x" * 100 + "[REDACTED:private_key]"
+    assert a["jwt"] == "y" * 600 + " [REDACTED:jwt]"
+    held = a["fixwire.exceptions"][0]["frames"][-1]["vars"]["held"]
+    assert held == "'" + "q" * 900 + " [REDACTED:jwt]'"
+    body = ingest.requests[0]["body"].decode()  # the source lines show how KEY and JWT are made, once
+    assert "MIIEowIBAAKCAQEA" * 2 not in body and "c3ViIjoiYWRhIn0" * 2 not in body
+    # Nothing on the wire is longer than 1,024 bytes (the exception's frames included).
+    for frame in a["fixwire.exceptions"][0]["frames"]:
+        for v in frame.get("vars", {}).values():
+            assert len(v.encode()) <= 1024
+
+
+def test_a_query_is_redacted_as_part_of_its_url(ingest):
+    with Client(ingest.dsn, default_integrations=False) as client:
+        client.capture_event(
+            {
+                "message": "callback failed",
+                "request": {
+                    "method": "GET",
+                    "url": "https://shop.example/cb",
+                    "query_string": "code=SplxlOBeZQQYbYS6&state=x1",
+                },
+            }
+        )
+        assert client.flush(5)
+    [(record, _)] = ingest.records()
+    assert record["attributes"]["url.full"] == "https://shop.example/cb?code=[REDACTED:secret_assignment]&state=x1"
+
+
+def test_a_string_redaction_fails_on_is_sent_filtered(ingest, monkeypatch):
+    from fixwire._core.redact import Redactor
+
+    real = Redactor.mask
+
+    def mask(self, s):
+        if "boom" in s:
+            raise RuntimeError("redaction failed")
+        return real(self, s)
+
+    monkeypatch.setattr(Redactor, "mask", mask)
+    with Client(ingest.dsn, default_integrations=False) as client:
+        fixwire.set_extra("note", "boom: ada@example.com")
+        client.capture_message("boom for ada@example.com")
+        assert client.flush(5)
+    [(record, _)] = ingest.records()
+    assert record["body"]["stringValue"] == "[Filtered]" and record["attributes"]["note"] == "[Filtered]"
+    assert "ada@example.com" not in ingest.requests[0]["body"].decode()
+
+
+def test_an_event_over_1_mb_sheds_breadcrumbs_then_vars_then_contexts(monkeypatch):
+    import gzip
+    import json
+
+    from fixwire._core import pipeline
+    from fixwire._core.options import Options
+
+    monkeypatch.setattr(pipeline, "MAX_EVENT_BYTES", 40_000)
+    core = pipeline.Core(Options(dsn="https://k@ingest.example", include_source_context=False))
+
+    def sent(crumbs, local_vars, contexts, extra=0):
+        event = {
+            "event_id": "0" * 32,
+            "level": "error",
+            "breadcrumbs": {"values": [{"message": "c%d" % i + "c" * 1000} for i in range(crumbs)]},
+            "exception": {
+                "values": [
+                    {
+                        "type": "E",
+                        "value": "v",
+                        "stacktrace": {
+                            "frames": [{"function": "f", "vars": {"v%d" % i: "x" * 1000 for i in range(local_vars)}}]
+                        },
+                    }
+                ]
+            },
+            "contexts": {
+                "trace": {"trace_id": "a" * 32, "span_id": "b" * 16},
+                "order": {"k%d" % i: "y" * 1000 for i in range(contexts)},
+            },
+            "extra": {"e%d" % i: "z" * 1000 for i in range(extra)},
+        }
+        out = core.encode(event)
+        if not out:
+            return None
+        [record] = json.loads(gzip.decompress(out[0].body))["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+        keys = {a["key"] for a in record["attributes"]}
+        return {
+            "breadcrumbs": "fixwire.breadcrumbs" in keys,
+            "vars": b'"vars"' in gzip.decompress(out[0].body),
+            "contexts": "fixwire.contexts" in keys,
+            "trace": "traceId" in record,
+        }
+
+    everything = {"breadcrumbs": True, "vars": True, "contexts": True, "trace": True}
+    assert sent(10, 10, 10) == everything
+    assert sent(40, 10, 10) == {**everything, "breadcrumbs": False}
+    assert sent(10, 40, 10) == {**everything, "breadcrumbs": False, "vars": False}
+    assert sent(10, 10, 40) == {"breadcrumbs": False, "vars": False, "contexts": False, "trace": True}
+    assert sent(10, 10, 10, extra=50) is None, "still over: dropped"
+
+
+def test_async_client_flush_and_close_keep_to_their_timeout(ingest):
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+
+    async def make():
+        return AsyncClient(ingest.dsn, default_integrations=False)
+
+    client = asyncio.run_coroutine_threadsafe(make(), loop).result(5)
+    busy = threading.Event()
+    loop.call_soon_threadsafe(busy.wait, 5)  # the loop is stuck in the app's code
+    client.capture_message("while the loop is busy")
+    started = time.monotonic()
+    assert client.flush(0.5) is False
+    client.close(0.5)
+    assert time.monotonic() - started < 1.5
+    busy.set()
+    asyncio.run_coroutine_threadsafe(client._async_driver.aclose(5), loop).result(10)  # the rest, once free
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(5)
+    loop.close()
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork()")
 def test_a_forked_child_does_not_wait_on_locks_held_at_the_fork(ingest):
     client = Client(ingest.dsn, default_integrations=False)

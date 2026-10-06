@@ -2,24 +2,30 @@
 # (walk_exception_chain, exceptions_from_error, single_exception_from_error_tuple,
 # serialize_frame, filename_for_module and the in-app rules); copyright and
 # provenance: NOTICE, UPSTREAM.md. Modified for Fixwire: local variables are captured only for in-app
-# frames, through bounded reprs and a per-capture time budget; source context
-# is added later, off the caller's thread (add_source_context).
+# frames, through bounded reprs and a per-capture time budget; chains stop at
+# MAX_EXCEPTIONS; source context is added later, off the caller's thread
+# (add_source_context), through a bounded cache.
 
 from __future__ import annotations
 
 import inspect
+import io
 import linecache
 import os
 import re
 import reprlib
 import stat
 import sys
+import threading
 import time
+import tokenize
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Mapping
 from types import FrameType, TracebackType
 from typing import TYPE_CHECKING, Any, cast
 
 from fixwire._core.jsonish import as_dict, as_list, dicts, get_dict
+from fixwire._core.serializer import UNREADABLE, BoundedRepr, clip, window
 
 if TYPE_CHECKING:
     from fixwire.types import ExcInfo
@@ -35,9 +41,14 @@ else:  # pragma: no cover
 LOCALS_BUDGET_SECONDS = 0.005
 #: Local variables kept per frame.
 MAX_LOCALS = 50
+#: Exceptions kept per event: the one raised and its causes (or a group's).
+MAX_EXCEPTIONS = 10
 CONTEXT_LINES = 5
 #: Source files larger than this are not read for context lines.
 MAX_SOURCE_BYTES = 10 << 20
+#: Source files kept read, and their bytes at most.
+MAX_SOURCE_FILES = 64
+MAX_SOURCE_CACHE_BYTES = 32 << 20
 
 _EXTERNAL = re.compile(r"[\\/](?:dist|site)-packages[\\/]")
 
@@ -82,8 +93,10 @@ class _Budget:
 
 
 def _bounded_repr(limit: int) -> reprlib.Repr:
-    r = reprlib.Repr()
-    r.maxstring = r.maxother = r.maxlong = max(16, limit)
+    """Reprs whose start holds what redaction reads before the cut to
+    ``limit`` (reprlib keeps a long one's start and end: twice that)."""
+    r = BoundedRepr()
+    r.maxstring = r.maxother = r.maxlong = 2 * max(16, window(limit))
     r.maxlevel = 3
     r.maxlist = r.maxtuple = r.maxset = r.maxfrozenset = r.maxdeque = r.maxarray = 10
     r.maxdict = 10
@@ -101,7 +114,7 @@ def safe_repr(value: Any) -> str:
     try:
         return repr(value)
     except Exception:
-        return "<broken repr>"
+        return UNREADABLE
 
 
 def get_type_name(cls: type | None) -> str | None:
@@ -207,6 +220,8 @@ def serialize_frame(frame: FrameType, tb_lineno: int | None, o: Options, budget:
 
 
 def _locals(frame: FrameType, limit: int, budget: _Budget) -> dict[str, Any]:
+    """Reprs of a frame's variables, cut to max_value_length later, once
+    redacted."""
     r = _bounded_repr(limit)
     out: dict[str, str] = {}
     try:
@@ -219,9 +234,9 @@ def _locals(frame: FrameType, limit: int, budget: _Budget) -> dict[str, Any]:
         if name.startswith("__") and name.endswith("__"):
             continue
         try:
-            out[name] = r.repr(value)[:limit]
+            out[name] = clip(r.repr(value), window(limit))
         except Exception:
-            out[name] = "<broken repr>"
+            out[name] = UNREADABLE
     return out
 
 
@@ -271,10 +286,12 @@ def single_exception(
 
 
 def walk_exception_chain(exc_info: ExcInfo) -> Iterator[ExcInfo]:
+    """The exception and its causes, MAX_EXCEPTIONS at most, until one
+    comes back."""
     exc_type, exc_value, tb = exc_info
     seen: list[BaseException] = []
     seen_ids: set[int] = set()
-    while id(exc_value) not in seen_ids:
+    while id(exc_value) not in seen_ids and len(seen) < MAX_EXCEPTIONS:
         yield exc_type, exc_value, tb
         seen.append(exc_value)
         seen_ids.add(id(exc_value))
@@ -296,7 +313,7 @@ def _exceptions_from_error(
     source: str | None,
     seen_ids: set[int],
 ) -> tuple[int, list[dict[str, Any]]]:
-    if exc_value is not None and id(exc_value) in seen_ids:
+    if (exc_value is not None and id(exc_value) in seen_ids) or len(seen_ids) >= MAX_EXCEPTIONS:
         return exception_id, []
     if exc_value is not None:
         seen_ids.add(id(exc_value))
@@ -401,19 +418,62 @@ def _iter_stacktraces(event: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 yield st
 
 
-def _source_lines(path: str) -> list[str]:
-    """A file's lines (linecache), unless it isn't a regular file (a FIFO
-    would block, a device never end) or is too large to read."""
-    if path not in linecache.cache:
-        st = os.stat(path)
+#: Source files read: path → (lines, bytes), least recently used first.
+_sources: OrderedDict[str, tuple[list[str], int]] = OrderedDict()
+_sources_lock = threading.Lock()
+
+
+def _reset_sources() -> None:
+    """In a forked child: a lock another thread held at the fork stays held."""
+    global _sources_lock
+    _sources_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_sources)
+
+
+def _read_source(path: str) -> tuple[list[str], int]:
+    """A file's lines and size, unless it isn't a regular file (a FIFO would
+    block, a device never end) or is too large to read. Opened without
+    blocking and checked once open, so the file checked is the file read."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with open(fd, "rb") as f:
+        st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_SOURCE_BYTES:
-            return []
-    return linecache.getlines(path)
+            return [], 0
+        data = f.read(MAX_SOURCE_BYTES + 1)
+    if len(data) > MAX_SOURCE_BYTES:
+        return [], 0
+    encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+    return io.TextIOWrapper(io.BytesIO(data), encoding, errors="replace").readlines(), len(data)
+
+
+def _source_lines(path: str) -> list[str]:
+    """A file's lines, through a cache of MAX_SOURCE_FILES files and
+    MAX_SOURCE_CACHE_BYTES at most. Code that isn't in a file (an
+    interactive shell's) comes from linecache when its owner put it there."""
+    if path in linecache.cache:
+        return linecache.getlines(path)
+    with _sources_lock:
+        hit = _sources.get(path)
+        if hit is not None:
+            _sources.move_to_end(path)
+            return hit[0]
+    lines, size = _read_source(path)
+    with _sources_lock:
+        _sources[path] = (lines, size)
+        total = sum(n for _, n in _sources.values())
+        while len(_sources) > MAX_SOURCE_FILES or (total > MAX_SOURCE_CACHE_BYTES and len(_sources) > 1):
+            _, (_, n) = _sources.popitem(last=False)
+            total -= n
+    return lines
 
 
 def add_source_context(event: dict[str, Any], max_length: int) -> None:
     """Adds lines around each frame (read from disk, cached), on the
-    delivery side so the caller never waits on file I/O."""
+    delivery side so the caller never waits on file I/O. Lines are kept to
+    what redaction reads; the cut to ``max_length`` comes after it."""
     for frame in iter_event_frames(event):
         path, lineno = frame.get("abs_path"), frame.get("lineno")
         if not path or not isinstance(lineno, int) or "context_line" in frame:
@@ -426,9 +486,9 @@ def add_source_context(event: dict[str, Any], max_length: int) -> None:
         if not lines or not 0 <= idx < len(lines):
             continue
 
-        def clip(s: str) -> str:
-            return s.rstrip("\r\n")[:max_length]
+        def line(s: str) -> str:
+            return clip(s.rstrip("\r\n"), window(max_length))
 
-        frame["pre_context"] = [clip(x) for x in lines[max(0, idx - CONTEXT_LINES) : idx]]
-        frame["context_line"] = clip(lines[idx])
-        frame["post_context"] = [clip(x) for x in lines[idx + 1 : idx + 1 + CONTEXT_LINES]]
+        frame["pre_context"] = [line(x) for x in lines[max(0, idx - CONTEXT_LINES) : idx]]
+        frame["context_line"] = line(lines[idx])
+        frame["post_context"] = [line(x) for x in lines[idx + 1 : idx + 1 + CONTEXT_LINES]]

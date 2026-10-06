@@ -34,8 +34,8 @@ from typing import (
 )
 
 import fixwire
-from fixwire._core.serializer import Serializer
-from fixwire._core.tracing import Span, use_span
+from fixwire._core.serializer import Serializer, clip, window
+from fixwire._core.tracing import MAX_AI_CONTENT, Span, use_span
 
 if TYPE_CHECKING:
     from typing_extensions import Unpack
@@ -55,10 +55,10 @@ __all__ = [
     "arguments_hash",
 ]
 
-#: Longest recorded content attribute (characters).
-MAX_AI_CONTENT = 16_384
-
 _serialize = Serializer(MAX_AI_CONTENT)
+#: Content is kept to what redaction reads; the cut to MAX_AI_CONTENT bytes
+#: (longest recorded content attribute) comes after it, when it is sent.
+_serialize_content = Serializer(window(MAX_AI_CONTENT))
 
 
 class TokenUsage(TypedDict, total=False):
@@ -73,8 +73,8 @@ class TokenUsage(TypedDict, total=False):
     """Input tokens written to the provider's prompt cache."""
 
 
-def _canonical(value: Any) -> str:
-    return json.dumps(_serialize(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+def _canonical(value: Any, serialize: Serializer = _serialize) -> str:
+    return json.dumps(serialize(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 def arguments_hash(value: Any) -> str:
@@ -86,8 +86,8 @@ def arguments_hash(value: Any) -> str:
 
 
 def _content(value: Any) -> str:
-    s = value if isinstance(value, str) else _canonical(value)
-    return s[: MAX_AI_CONTENT - 3] + "..." if len(s) > MAX_AI_CONTENT else s
+    s = value if isinstance(value, str) else _canonical(value, _serialize_content)
+    return clip(s, window(MAX_AI_CONTENT))
 
 
 def _maybe(record: bool, value: Any) -> str | None:

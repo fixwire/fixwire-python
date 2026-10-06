@@ -1,33 +1,43 @@
 """Delivery as a sans-IO state machine: the queue policy, retries with
 backoff and rate limits. Drivers (a thread, an asyncio task) feed it time
-and HTTP outcomes and ask what to send next; it never sleeps, reads a clock
-or opens a socket, which is what lets the sync and async clients share it.
+and HTTP outcomes and ask what to send next; it never sleeps, opens a
+socket or reads a clock but the wall clock an HTTP-date Retry-After counts
+from, which is what lets the sync and async clients share it.
 
 Each queued item is one request: a /v1 path, a content type and a body.
 
-Retries: network errors, 429 and 5xx, with exponential backoff and jitter
-from 1 s to 5 min (at least Retry-After), up to 6 attempts. Other 4xx are
-final: the server will not change its mind. Fixwire-Rate-Limits
-("60:log;span, 3600:file"; no categories: all of them) pauses those kinds
-of data while the rest keeps flowing; paused requests wait in the queue, and
-are the first to go when it is full.
+Retries: no answer, 429 and 5xx, at most 3 times, waiting about 1 s, then
+twice as long each time (at least Retry-After); a request whose next try
+would be more than 5 minutes away is dropped. Other 4xx are final: the
+server will not change its mind. A 429 without Fixwire-Rate-Limits pauses
+all data for Retry-After, at least 60 s, and a 5xx with Retry-After pauses
+it for that long. Fixwire-Rate-Limits ("60:log;span, 3600:file"; no
+categories: all of them) pauses those kinds of data while the rest keeps
+flowing; paused requests wait in the queue. At most max_items requests wait
+to be sent and as many wait for a retry; past that, new ones are dropped.
 """
 
 from __future__ import annotations
 
+import email.utils
 import math
 import random
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 BACKOFF_BASE = 1.0
-BACKOFF_MAX = 300.0
-MAX_ATTEMPTS = 6
-#: Seconds a 429 without Retry-After waits.
+#: The first try and 3 retries.
+MAX_ATTEMPTS = 4
+#: A request whose next try would be further away than this is dropped.
+MAX_DELAY = 300.0
+#: Seconds a 429 without Fixwire-Rate-Limits pauses all data at least.
 DEFAULT_RETRY_AFTER = 60.0
 #: The longest a Retry-After or a rate limit holds data back, in seconds.
 MAX_WAIT = 24 * 3600.0
+#: The rate-limit categories (PROTOCOL.md §2); "" is all of them.
+CATEGORIES = frozenset({"error", "log", "span", "session", "check_in", "feedback", "file"})
 
 
 @dataclass
@@ -57,7 +67,8 @@ class Decision:
 
 def parse_rate_limits(header: str, now: float) -> dict[str, float]:
     """Fixwire-Rate-Limits ("60:log;span, 3600:file") to {category: until};
-    "" (an empty category list) means every category."""
+    "" (an empty category list) means every category. Categories Fixwire
+    doesn't name are ignored."""
     out: dict[str, float] = {}
     for limit in header.split(","):
         seconds, sep, categories = limit.strip().partition(":")
@@ -67,7 +78,8 @@ def parse_rate_limits(header: str, now: float) -> dict[str, float]:
             until = now + _seconds(seconds)
         except ValueError:
             continue
-        for cat in [c.strip() for c in categories.split(";") if c.strip()] or [""]:
+        named = [c.strip() for c in categories.split(";") if c.strip()]
+        for cat in [c for c in named if c in CATEGORIES] if named else [""]:
             out[cat] = max(out.get(cat, 0.0), until)
     return out
 
@@ -81,10 +93,19 @@ def _seconds(value: str) -> float:
     return min(max(0.0, seconds), MAX_WAIT)
 
 
-def _retry_after(value: str | None) -> float | None:
+def _retry_after(value: str | None, wall: float) -> float | None:
+    """Retry-After in seconds (from 0 to MAX_WAIT): a number of seconds or
+    an HTTP date; None when missing or broken."""
+    if not value:
+        return None
     try:
-        return _seconds(value) if value else None
+        return _seconds(value)
     except ValueError:
+        pass
+    try:
+        date = email.utils.parsedate_to_datetime(value)
+        return min(max(0.0, date.timestamp() - wall), MAX_WAIT)
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -93,23 +114,37 @@ class Delivery:
     max_items: int = 100
     max_bytes: int = 32 << 20
     rng: Callable[[], float] = random.random
+    #: The wall clock an HTTP-date Retry-After counts from.
+    clock: Callable[[], float] = time.time
     queue: deque[Outbound] = field(default_factory=deque[Outbound])
     limits: dict[str, float] = field(default_factory=dict[str, float])
     queued_bytes: int = 0
+    #: Requests in the queue waiting for a retry.
+    retrying: int = 0
     #: Requests dropped because the queue was full.
     overflowed: int = 0
 
-    def offer(self, item: Outbound, now: float) -> None:
-        """Queues a request. Past max_items or max_bytes one goes: the
-        oldest paused by a rate limit, else the oldest."""
-        self.queue.append(item)
-        self.queued_bytes += len(item.body)
-        while len(self.queue) > self.max_items or (self.queued_bytes > self.max_bytes and len(self.queue) > 1):
-            idx = next((i for i, q in enumerate(self.queue) if self.paused_until(q.category) > now), 0)
-            old = self.queue[idx]
-            del self.queue[idx]
-            self.queued_bytes -= len(old.body)
+    def offer(self, item: Outbound, now: float) -> bool:
+        """Queues a request; False when it is dropped: paused for longer
+        than MAX_DELAY, or past max_items (or max_bytes) waiting."""
+        if self.ready_at(item) - now > MAX_DELAY:
+            return False
+        return self._add(item, left=False)
+
+    def _add(self, item: Outbound, left: bool) -> bool:
+        """Queues a request unless max_items like it (new ones, or ones
+        waiting for a retry) or max_bytes wait already."""
+        waiting = self.retrying if item.attempts else len(self.queue) - self.retrying
+        if waiting >= self.max_items or (self.queue and self.queued_bytes + len(item.body) > self.max_bytes):
             self.overflowed += 1
+            return False
+        if left:
+            self.queue.appendleft(item)
+        else:
+            self.queue.append(item)
+        self.queued_bytes += len(item.body)
+        self.retrying += 1 if item.attempts else 0
+        return True
 
     def paused_until(self, category: str) -> float:
         """Until when a rate limit holds this category back."""
@@ -127,6 +162,8 @@ class Delivery:
             if self.ready_at(item) <= now:
                 del self.queue[i]
                 self.queued_bytes -= len(item.body)
+                if item.attempts:
+                    self.retrying -= 1
                 return item
         return None
 
@@ -143,12 +180,14 @@ class Delivery:
             return Decision(sent=True)
         if status != 429 and status < 500:
             return Decision(dropped=True, reason="status %d" % status)
-        wait = _retry_after(headers.get("retry-after"))
-        if status == 429:
-            wait = DEFAULT_RETRY_AFTER if wait is None else wait
-            if not limits:
-                # Rate limited without saying which data: everything waits.
-                self.limits[""] = max(self.limits.get("", 0.0), now + wait)
+        wait = _retry_after(headers.get("retry-after"), self.clock())
+        if status == 429 and not limits:
+            # Rate limited without saying which data: everything waits.
+            wait = max(wait or 0.0, DEFAULT_RETRY_AFTER)
+            self.limits[""] = max(self.limits.get("", 0.0), now + wait)
+        elif status >= 500 and wait is not None:
+            # Unavailable for a while: everything waits.
+            self.limits[""] = max(self.limits.get("", 0.0), now + wait)
         return self._retry(item, now, "status %d" % status, wait)
 
     def on_error(self, item: Outbound, now: float, err: str = "network error") -> Decision:
@@ -158,11 +197,20 @@ class Delivery:
         item.attempts += 1
         if item.attempts >= MAX_ATTEMPTS:
             return Decision(dropped=True, reason=reason)
-        delay = min(BACKOFF_MAX, BACKOFF_BASE * (2 ** (item.attempts - 1))) * (0.5 + self.rng() / 2)
+        delay = BACKOFF_BASE * (2 ** (item.attempts - 1)) * (0.5 + self.rng() / 2)
         item.not_before = now + max(delay, wait or 0.0)
-        self.queue.appendleft(item)
-        self.queued_bytes += len(item.body)
+        if self.ready_at(item) - now > MAX_DELAY:
+            return Decision(dropped=True, reason=reason + "; the next try is too far away")
+        if not self._add(item, left=True):
+            return Decision(dropped=True, reason=reason + "; too many requests wait for a retry")
         return Decision(retry=True, reason=reason)
+
+    def take(self) -> list[Outbound]:
+        """Empties the queue (for another driver)."""
+        out = list(self.queue)
+        self.queue.clear()
+        self.queued_bytes = self.retrying = 0
+        return out
 
     def empty(self) -> bool:
         return not self.queue
