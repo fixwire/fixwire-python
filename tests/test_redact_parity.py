@@ -1,5 +1,6 @@
-"""The shared corpus from pkg/redact in fixwire/fixwire: the server's scrubber and this
-port must agree on every case."""
+"""The shared corpus of the Fixwire server's redaction (a copy of
+pkg/redact/testdata/vectors.json in fixwire/fixwire, kept identical): the
+server's scrubber and this port must agree on every case."""
 
 import json
 import pathlib
@@ -9,17 +10,7 @@ import pytest
 
 from fixwire._core.redact import DEFAULT_DETECTORS, DEFAULT_SENSITIVE_KEYS, Redactor
 
-
-def _corpus() -> pathlib.Path:
-    """The corpus, in the repository root's pkg/ above this SDK (wherever it sits)."""
-    for parent in pathlib.Path(__file__).resolve().parents:
-        candidate = parent / "pkg" / "redact" / "testdata" / "vectors.json"
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError("pkg/redact/testdata/vectors.json not found above " + __file__)
-
-
-CORPUS = _corpus()
+CORPUS = pathlib.Path(__file__).with_name("vectors.json")
 VECTORS = json.loads(CORPUS.read_text())
 
 
