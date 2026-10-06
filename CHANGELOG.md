@@ -4,7 +4,7 @@ All notable changes to the Fixwire Python SDK are listed here. Versions follow [
 Versioning](https://semver.org); before 1.0, a minor version may change the
 API.
 
-## [Unreleased]
+## [0.1.1] - 2026-10-06
 
 - Fingerprinting a message with many "@" no longer hangs the caller (the email pattern backtracked cubically).
 - Redaction stays linear on hostile text: JWTs are found by a scanner (same matches as the server), and many findings no longer cost quadratic time.
