@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import logging
 import math
 import threading
@@ -17,7 +18,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Callable
-from types import TracebackType
+from types import FrameType, TracebackType
 from typing import TYPE_CHECKING, Any, cast
 
 from fixwire._core.options import Options
@@ -46,8 +47,13 @@ class Client:
     """
 
     def __init__(self, dsn: str | None = None, **options: Unpack[ClientOptions]) -> None:
-        self.options: Options = Options.from_kwargs(dsn, **options)
-        self.core: Core = Core(self.options)
+        try:
+            self.options: Options = Options.from_kwargs(dsn, **options)
+            self.core: Core = Core(self.options)
+        except Exception as e:  # a broken DSN or option can't stop the app from starting
+            warn_off(e)
+            self.options = Options.off()
+            self.core = Core(self.options)
         self._thread_driver: ThreadDriver | None = None
         self._lock = threading.Lock()
         self._closed = False
@@ -392,6 +398,21 @@ class AsyncClient(Client):
             else:
                 self._hand_over()
         super().close(_left(deadline))
+
+
+def warn_off(reason: object) -> None:
+    """Says on stderr (a warning, debug or not) why the SDK stays off,
+    pointing at the app's line that started it."""
+    level = 1
+    frame = inspect.currentframe()
+    while frame is not None and frame.f_back is not None and _ours(frame):
+        frame = frame.f_back
+        level += 1
+    warnings.warn("fixwire is off: %s" % reason, stacklevel=level)
+
+
+def _ours(frame: FrameType) -> bool:
+    return str(frame.f_globals.get("__name__", "")).partition(".")[0] == "fixwire"
 
 
 def _left(deadline: float) -> float:

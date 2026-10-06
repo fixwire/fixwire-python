@@ -366,6 +366,7 @@ def test_source_context_reads_regular_files_only(tmp_path):
 
 
 def test_source_lines_come_through_a_bounded_cache(tmp_path, monkeypatch):
+    assert (event_builder.MAX_SOURCE_FILES, event_builder.MAX_SOURCE_CACHE_BYTES) == (64, 32 << 20)
     monkeypatch.setattr(event_builder, "_sources", collections.OrderedDict())
     monkeypatch.setattr(event_builder, "MAX_SOURCE_FILES", 3)
 
@@ -383,6 +384,15 @@ def test_source_lines_come_through_a_bounded_cache(tmp_path, monkeypatch):
     big = tmp_path / "big.py"
     big.write_bytes(b"x = 1\n" + b"#" * event_builder.MAX_SOURCE_BYTES)  # 10 MB and 6 bytes
     assert context_line(big) is None
+    # And at most MAX_SOURCE_CACHE_BYTES: two 12-byte files fit 24, a third
+    # pushes the oldest out; one file over the budget stays alone.
+    event_builder._sources.clear()
+    monkeypatch.setattr(event_builder, "MAX_SOURCE_CACHE_BYTES", 24)
+    for p in paths[:3]:
+        context_line(p)
+    assert list(event_builder._sources) == [str(p) for p in paths[1:3]]
+    monkeypatch.setattr(event_builder, "MAX_SOURCE_CACHE_BYTES", 10)
+    assert context_line(paths[3]) == "a = 3" and list(event_builder._sources) == [str(paths[3])]
 
 
 def test_breadcrumbs_keep_the_last_ones_in_constant_time():
@@ -443,6 +453,34 @@ def test_delivery_retries():
     for status in (400, 401, 403, 404, 413, 415):
         d.offer(req(b"y"), 0.0)
         assert d.on_response(d.next(0.0), status, {}, 0.0).dropped and d.empty()
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        [429, 429, 429, 429],
+        [None, 503, 429, 500],
+        [429, None, None, 502],
+        ["limited", 503, "limited", None],
+    ],
+)
+def test_a_request_is_sent_at_most_4_times_a_429s_retry_included(answers):
+    d = Delivery(rng=lambda: 1.0)
+    item = req(b"x")
+    d.offer(item, 0.0)
+    now, sent = 0.0, 0
+    for answer in answers:
+        assert d.next(now) is item
+        sent += 1
+        if answer is None:
+            dec = d.on_error(item, now)
+        elif answer == "limited":
+            dec = d.on_response(item, 429, {"retry-after": "1", "fixwire-rate-limits": "1:error"}, now)
+        else:
+            dec = d.on_response(item, int(answer), {}, now)
+        assert dec.retry is (sent < MAX_ATTEMPTS), answers
+        now = d.wake_at() or now
+    assert sent == MAX_ATTEMPTS == 4 and dec.dropped and d.empty()
 
 
 def test_rate_limits_pause_some_data_while_the_rest_flows():

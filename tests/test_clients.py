@@ -502,6 +502,44 @@ def test_no_dsn_is_a_noop():
     assert not client.enabled and client.capture_message("x") is None and client.flush()
 
 
+@pytest.mark.parametrize(
+    ("dsn", "options", "said"),
+    [
+        ("ftp://k@ingest.example", {}, "scheme is 'ftp'"),
+        ("https://ingest.example", {}, "no key"),
+        ("https://k@", {}, "no host"),
+        ("https://k@ingest.example:port", {}, "bad port"),
+        ("https://k@ingest.example", {"dns": "https://k@typo.example"}, "unknown option(s): dns"),
+        ("https://k@ingest.example", {"sample_rate": 1.5}, "sample_rate"),
+        ("https://k@ingest.example", {"max_breadcrumbs": -1}, "max_breadcrumbs"),
+        ("https://k@ingest.example", {"rate_limit": {"burst": 1}}, "burst"),
+        ("https://k@ingest.example", {"transport": "asyncio"}, "needs a running event loop"),
+    ],
+)
+def test_init_never_raises_a_broken_dsn_or_option_is_said_and_the_sdk_stays_off(dsn, options, said, monkeypatch):
+    monkeypatch.setenv("FIXWIRE_DSN", "https://k@fallback.example")  # not read instead
+    with pytest.warns(UserWarning, match="^fixwire is off: .*" + said.replace("(", r"\(").replace(")", r"\)")) as w:
+        client = fixwire.init(dsn, **options)
+    assert w[0].filename == __file__, "the warning points at the app's line"
+    assert not client.enabled and not client.options.default_integrations
+    assert fixwire.capture_message("x") is None and fixwire.flush(1)
+    if "transport" not in options:  # the clients themselves don't raise either
+        with pytest.warns(UserWarning, match="^fixwire is off: ") as w:
+            assert not Client(dsn, **options).enabled
+        assert w[0].filename == __file__
+
+
+def test_a_broken_dsn_is_said_on_stderr_without_debug():
+    import subprocess
+    import sys
+
+    script = "import fixwire\nclient = fixwire.init('https://ingest.example')\nprint(client.enabled)\n"
+    env = {**os.environ, "PYTHONWARNINGS": ""}
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=60)
+    assert out.returncode == 0 and out.stdout == "False\n"
+    assert "<string>:2: UserWarning: fixwire is off: the DSN has no key" in out.stderr
+
+
 def test_feedback_is_sent_unsampled_with_its_rating_trace_and_event(ingest):
     trace_id = "0af7651916cd43dd8448eb211c80319c"
     with Client(
@@ -546,6 +584,56 @@ def test_feedback_names_who_gave_it_redacted(ingest):
     assert body["name"] == "Ada" and body["email"] == "[REDACTED:email]"
     assert body["message"] == "My card [REDACTED:credit_card] was charged twice"
     assert body["url"] == "https://shop.example/help"
+
+
+def test_feedback_is_redacted_then_cut(ingest):
+    with Client(ingest.dsn, max_value_length=40, default_integrations=False) as client:
+        fixwire.set_user({"username": "Ada " * 20, "email": "ada@example.com"})
+        client.capture_feedback("Refund ada@example.com " + "x" * 100, url="https://shop.example/a?token=" + "s" * 40)
+        client.capture_feedback("y" * 40)
+        assert client.flush(5)
+    cut, fits = ingest.bodies("/v1/feedback")
+    assert cut["message"] == "Refund [REDACTED:email] " + "x" * 13 + "...", "redacted, then cut to 40 bytes"
+    assert cut["name"] == ("Ada " * 10)[:37] + "..." and cut["email"] == "[REDACTED:email]"
+    assert cut["url"] == "https://shop.example/a?token=[REDACTE..."
+    assert fits["message"] == "y" * 40
+
+
+def test_the_apps_configuration_is_cut_but_never_redacted(ingest, monkeypatch):
+    # Each an email to a detector: masked, release health would break.
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "checkout@team.example" + "s" * 40)
+    host = "web@pod.example" + "h" * 40
+    client = fixwire.init(
+        ingest.dsn,
+        release="api@1.2.3.example",
+        environment="qa@ci.example",
+        server_name=host,
+        max_value_length=40,
+        traces_sample_rate=1.0,
+        default_integrations=False,
+    )
+    fixwire.capture_message("deployed by ada@example.com")
+    with fixwire.start_span("checkout"):
+        pass
+    client.start_request_session()()
+    monitor = "ops@cron.example-" + "r" * 60
+    client.capture_check_in(monitor, monitor_config={"owner": "ops@team.example"})
+    client.capture_feedback("thanks")
+    assert fixwire.flush(5)
+    [(record, res)] = ingest.records()
+    assert record["body"]["stringValue"] == "deployed by [REDACTED:email]", "the app's data still is"
+    for r in [res] + [r for _, r in ingest.otlp_spans()]:
+        assert r["service.name"] == "checkout@team.example" + "s" * 16 + "..."
+        assert r["service.version"] == "api@1.2.3.example" and r["deployment.environment.name"] == "qa@ci.example"
+        assert r["host.name"] == host[:37] + "..."
+    [sessions] = ingest.bodies("/v1/sessions")
+    [feedback] = ingest.bodies("/v1/feedback")
+    for body in (sessions, feedback):
+        assert (body["release"], body["environment"]) == ("api@1.2.3.example", "qa@ci.example")
+    [check_in] = [r for r in ingest.requests if r["path"].startswith("/v1/check-ins/")]
+    assert check_in["path"] == "/v1/check-ins/ops%40cron.example-" + "r" * 20 + "..."
+    assert check_in["json"]["monitor_config"] == {"owner": "ops@team.example"}
+    assert check_in["json"]["environment"] == "qa@ci.example"
 
 
 def test_check_ins(ingest):

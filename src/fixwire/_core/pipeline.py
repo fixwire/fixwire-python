@@ -62,7 +62,9 @@ MAX_SPANS_PER_REQUEST = 100
 #: "feedback" or "check_in".
 _KIND = "__kind__"
 
-#: Fields redaction skips: ids, times and the SDK's own.
+#: Fields redaction skips: ids, times, the SDK's own and the app's own
+#: configuration (cut, but sent as given: masking "api@1.2.3.example" as an
+#: email would break release health).
 _REDACT_SKIP = (
     "event_id",
     "timestamp",
@@ -72,6 +74,7 @@ _REDACT_SKIP = (
     "release",
     "dist",
     "environment",
+    "server_name",
     "start_timestamp",
 )
 _FEEDBACK_SKIP = ("sdk", "feedback_id", "timestamp", "event_id", "trace_id", "release", "environment", "source")
@@ -131,7 +134,7 @@ class Core:
         #: Request sessions, until sent (release health).
         self.sessions = Aggregates()
         #: The resource's service.name.
-        self.service = protocol.service_name(options.release)
+        self.service = self._setting(protocol.service_name(options.release))
         self._random = random.random
         self.spool = None
         if options.offline and options.dsn:
@@ -171,7 +174,7 @@ class Core:
         self, message: str, score: float, trace_id: str | None, event_id: str | None, url: str | None, source: str
     ) -> dict[str, Any]:
         """A /v1/feedback body for the queue: neither sampled, rate limited
-        nor passed to before_send (redaction still applies when encoded)."""
+        nor passed to before_send (redacted and cut when encoded)."""
         o = self.options
         if trace_id is None:
             from fixwire._core.tracing import current_span
@@ -341,14 +344,16 @@ class Core:
                 return list(self._encode_spans(item["spans"]))
             if kind == "sessions":
                 return self._encode_sessions()
+            limit = self.options.max_value_length
             if kind == "feedback":
-                body = cast("dict[str, Any]", item["body"])
-                return [
-                    self._request(protocol.FEEDBACK, protocol.dumps(self._redact(body, _FEEDBACK_SKIP)), "feedback")
-                ]
+                # Redacted (its message, who gave it, the page), then cut.
+                body = {k: self.serializer(v, 1) for k, v in cast("dict[str, Any]", item["body"]).items()}
+                body = clip_strings(self._redact(body, _FEEDBACK_SKIP), limit)
+                return [self._request(protocol.FEEDBACK, protocol.dumps(body), "feedback")]
             if kind == "check_in":
-                path = protocol.CHECK_INS + quote(str(item["monitor"]), safe="")
-                return [self._request(path, protocol.dumps(item["body"]), "check_in")]
+                # The app's own configuration: cut, not redacted.
+                path = protocol.CHECK_INS + quote(clip(str(item["monitor"]), limit), safe="")
+                return [self._request(path, protocol.dumps(clip_strings(item["body"], limit)), "check_in")]
             out = self._encode_event(item)
             return [out] if out is not None else []
         except Exception:
@@ -399,6 +404,11 @@ class Core:
         """A finished segment as a queue item; encoded by the driver."""
         return {_KIND: "spans", "spans": [s.to_json() for s in segment.spans()]}
 
+    def _setting(self, value: str | None) -> str | None:
+        """The app's own configuration as sent (release, environment,
+        service and server names): cut, never redacted."""
+        return clip(value, self.options.max_value_length) if value else None
+
     def _string(self, s: str, limit: int) -> str:
         """A string as sent: redacted over the part kept and the next 16 kB,
         then cut to ``limit``."""
@@ -430,7 +440,8 @@ class Core:
         for s in records:
             self._bound_span(s)
         o = self.options
-        res = protocol.resource(self.service, o.release, o.environment, o.server_name)
+        cut = self._setting
+        res = protocol.resource(self.service, cut(o.release), cut(o.environment), cut(o.server_name))
         spans = [protocol.span(s) for s in records]
         if len(spans) <= MAX_SPANS_PER_REQUEST:
             body = protocol.dumps(protocol.traces(res, spans))
@@ -463,8 +474,8 @@ class Core:
         for i in range(0, len(aggregates), MAX_AGGREGATES):
             body = {
                 "sdk": protocol.sdk(),
-                "release": self.options.release or "",
-                "environment": self.options.environment or "production",
+                "release": self._setting(self.options.release) or "",
+                "environment": self._setting(self.options.environment) or "production",
                 "aggregates": aggregates[i : i + MAX_AGGREGATES],
             }
             out.append(self._request(protocol.SESSIONS, protocol.dumps(body), "session"))

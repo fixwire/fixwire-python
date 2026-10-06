@@ -104,6 +104,8 @@ class Options:
             self.project_root = os.getcwd()
         if not 0.0 <= self.sample_rate <= 1.0:
             raise ValueError("sample_rate must be between 0 and 1")
+        if self.max_breadcrumbs < 0:
+            raise ValueError("max_breadcrumbs must be 0 or more")
 
     @classmethod
     def from_kwargs(cls, dsn: str | None = None, **kwargs: Any) -> Options:
@@ -114,6 +116,12 @@ class Options:
         if isinstance(kwargs.get("rate_limit"), dict):
             kwargs["rate_limit"] = RateLimit(**kwargs["rate_limit"])
         return cls(dsn=dsn, **kwargs)
+
+    @classmethod
+    def off(cls) -> Options:
+        """The options of an SDK that stays off: no DSN (FIXWIRE_DSN isn't
+        read either) and no integrations."""
+        return cls(dsn="", default_integrations=False)
 
 
 def _hostname() -> str | None:

@@ -141,7 +141,7 @@ def test_incoming_tracestate_and_baggage_pass_on_whole_or_not_at_all():
     members = ",".join("k%d=%s" % (i, "v" * 90) for i in range(200))[: MAX_BAGGAGE - 1]
     assert incoming(baggage=members + "é")[1] == "", "8,193 bytes (é is two)"
     assert incoming(baggage=members + "e")[1] == members + "e", "8,192 bytes"
-    assert incoming(baggage="a=1,\tb=2") == ("", "a=1,\tb=2")
+    assert incoming("a=1,\tb=2", "a=1,\tb=2") == ("a=1,\tb=2", "a=1,\tb=2"), "a tab is W3C list whitespace"
     for broken in ("a=1\r\nx-injected: 1", "a=1\x00", "a=\x7f", "a=\x85"):
         assert incoming(broken, broken) == ("", ""), repr(broken)
 
@@ -150,6 +150,8 @@ def test_incoming_tracestate_and_baggage_pass_on_whole_or_not_at_all():
     "header",
     [
         "00-%s-%s-01" % (TRACE.upper(), PARENT),
+        "00-%s-%s-01" % (TRACE, PARENT.upper()),
+        "00-%s-%s-0A" % (TRACE, PARENT),
         "01-%s-%s-01" % (TRACE, PARENT),
         "00-%s-%s-01" % (TRACE, "0" * 16),
         "00-%s-%s-1" % (TRACE, PARENT),
@@ -478,6 +480,33 @@ def test_span_strings_are_redacted_then_cut(ingest):
     assert a["ratio"] == {"stringValue": "NaN"}
     content = {kv["key"]: kv["value"] for kv in chat["attributes"]}["gen_ai.input.messages"]["stringValue"]
     assert content == "y" * (ai.MAX_AI_CONTENT - 3) + "...", "recorded AI content keeps 16 kB"
+
+
+def test_ai_content_keeps_16_kb_other_ai_attributes_max_value_length(ingest):
+    from fixwire._core.tracing import AI_CONTENT, MAX_AI_CONTENT
+
+    # Prompts and system instructions, completions, tool arguments and results.
+    assert MAX_AI_CONTENT == 16_384 and AI_CONTENT == {
+        "gen_ai.input.messages",
+        "gen_ai.system_instructions",
+        "gen_ai.output.messages",
+        "gen_ai.tool.call.arguments",
+        "gen_ai.tool.call.result",
+    }
+    fixwire.init(ingest.dsn, traces_sample_rate=1.0, default_integrations=False)
+    with fixwire.start_span("fits", attributes=dict.fromkeys(AI_CONTENT, "y" * MAX_AI_CONTENT)):
+        pass
+    over = {**dict.fromkeys(AI_CONTENT, "y" * (MAX_AI_CONTENT + 1)), "gen_ai.tool.description": "d" * 1025}
+    with fixwire.start_span("over", attributes=over):
+        pass
+    assert fixwire.flush(5)
+    spans = {
+        s["name"]: {a["key"]: a["value"].get("stringValue") for a in s["attributes"]} for s, _ in ingest.otlp_spans()
+    }
+    for key in AI_CONTENT:
+        assert spans["fits"][key] == "y" * MAX_AI_CONTENT, key
+        assert spans["over"][key] == "y" * (MAX_AI_CONTENT - 3) + "...", key
+    assert spans["over"]["gen_ai.tool.description"] == "d" * 1021 + "...", "not content: max_value_length"
 
 
 def test_a_span_keeps_128_attributes(ingest):

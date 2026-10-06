@@ -27,7 +27,7 @@ class Dsn:
     def parse(cls, value: str) -> Dsn:
         parts = urlsplit(value.strip())
         if parts.scheme not in ("http", "https"):
-            raise BadDsn("unsupported scheme %r" % parts.scheme)
+            raise BadDsn("the DSN's scheme is %r, not http or https" % parts.scheme)
         if not parts.username:
             raise BadDsn("the DSN has no key")
         if not parts.hostname:

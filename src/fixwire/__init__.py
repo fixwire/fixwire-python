@@ -86,13 +86,21 @@ _last_event_id: str | None = None
 def init(dsn: str | None = None, **options: Unpack[ClientOptions]) -> Client:
     """Starts the SDK. Inside a running event loop (and with httpx
     installed) it delivers from that loop; otherwise from a thread.
-    ``transport="thread"`` or ``"asyncio"`` decides explicitly."""
+    ``transport="thread"`` or ``"asyncio"`` decides explicitly.
+
+    Never raises: a broken DSN or option is said in a warning (on stderr)
+    and the SDK stays off."""
     global _client
     transport = options.get("transport", "auto")
     if _client is not None:
         _client.close()
     client: Client
-    if transport == "asyncio" or (transport == "auto" and _loop_running() and _has_httpx()):
+    if transport == "asyncio" and not (_loop_running() and _has_httpx()):
+        from fixwire.client import warn_off
+
+        warn_off('transport="asyncio" needs a running event loop and httpx')
+        client = Client("", default_integrations=False)
+    elif transport == "asyncio" or (transport == "auto" and _loop_running() and _has_httpx()):
         client = AsyncClient(dsn, **options)
     else:
         client = Client(dsn, **options)
