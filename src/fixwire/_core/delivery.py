@@ -36,7 +36,7 @@ MAX_DELAY = 300.0
 DEFAULT_RETRY_AFTER = 60.0
 #: The longest a Retry-After or a rate limit holds data back, in seconds.
 MAX_WAIT = 24 * 3600.0
-#: The rate-limit categories (PROTOCOL.md §2); "" is all of them.
+#: The rate-limit categories (fixwire-protocol §2); "" is all of them.
 CATEGORIES = frozenset({"error", "log", "span", "session", "check_in", "feedback", "file"})
 
 

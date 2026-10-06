@@ -11,7 +11,7 @@ after before_send, so nothing a callback adds escapes it. It reads each
 string's part kept and the next 16 kB before the cut to max_value_length, so
 a secret the cut goes through is still found. Spans, sessions, check-ins and
 feedback are queued the same way and become their own requests
-(sdks/PROTOCOL.md).
+(fixwire-protocol).
 """
 
 from __future__ import annotations

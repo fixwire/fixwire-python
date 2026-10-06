@@ -1,4 +1,4 @@
-"""Fixwire protocol v1 on the wire (sdks/PROTOCOL.md): errors, messages and
+"""Fixwire protocol v1 on the wire (fixwire-protocol): errors, messages and
 spans travel as OTLP/HTTP JSON on /v1/logs and /v1/traces; sessions,
 check-ins and feedback as small JSON bodies on their own endpoints.
 
@@ -165,7 +165,7 @@ def traces(res: dict[str, Any], spans: list[dict[str, Any]]) -> dict[str, Any]:
     return {"resourceSpans": [{"resource": res, "scopeSpans": [{"scope": _SCOPE, "spans": spans}]}]}
 
 
-# Errors and messages (PROTOCOL.md §4).
+# Errors and messages (fixwire-protocol §4).
 
 
 def log_record(event: dict[str, Any]) -> dict[str, Any]:
@@ -260,7 +260,7 @@ def _exception(value: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-# Spans (PROTOCOL.md §3).
+# Spans (fixwire-protocol §3).
 
 
 def span_kind(op: str | None) -> int:
