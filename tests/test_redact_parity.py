@@ -58,10 +58,12 @@ BEGIN = "-----BEGIN "  # split, so no scanner sees a whole key
 @pytest.mark.parametrize(
     "text",
     [
-        "a." * 50_000 + "://",  # a URL scheme that never ends
-        (BEGIN + "RSA PRIVATE KEY-----\n") * 3_000,  # BEGIN lines without an END
+        "a." * 50_000 + "://",
+        (BEGIN + "RSA PRIVATE KEY-----\n") * 3_000,
         "x://u:" * 20_000,
     ],
+    # Short names: pytest puts a test's name in the environment, which Windows caps at 32 KB.
+    ids=["a URL scheme that never ends", "BEGIN lines without an END", "credentials that never end"],
 )
 def test_hostile_text_is_masked_in_linear_time(text: str) -> None:
     started = time.perf_counter()
