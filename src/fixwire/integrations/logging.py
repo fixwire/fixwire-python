@@ -4,6 +4,7 @@ through a handler on the root logger: nothing is patched."""
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 from fixwire.integrations import current_client, install_once
@@ -20,6 +21,9 @@ _LEVELS: dict[int, Level] = {
     logging.CRITICAL: "fatal",
 }
 _IGNORED = ("fixwire", "urllib3.connectionpool", "httpx", "httpcore")
+#: Set while a record is reported: what before_send, an event processor or
+#: before_breadcrumb log meanwhile isn't reported again (no recursion).
+_reporting: ContextVar[bool] = ContextVar("fixwire_logging_reporting", default=False)
 
 
 def _level(levelno: int) -> Level:
@@ -35,11 +39,12 @@ class FixwireHandler(logging.Handler):
         self.breadcrumb_level, self.event_level = breadcrumb_level, event_level
 
     def emit(self, record: logging.LogRecord) -> None:
-        if record.name.startswith(_IGNORED):
+        if record.name.startswith(_IGNORED) or _reporting.get():
             return
         client = current_client()
         if client is None:
             return
+        token = _reporting.set(True)
         try:
             if record.levelno >= self.event_level:
                 self._event(client, record)
@@ -55,6 +60,8 @@ class FixwireHandler(logging.Handler):
                 )
         except Exception:
             self.handleError(record)
+        finally:
+            _reporting.reset(token)
 
     def _event(self, client: Client, record: logging.LogRecord) -> None:
         event: dict[str, Any]

@@ -24,13 +24,17 @@ _FNV_OFFSET = 0xCBF29CE484222325
 _FNV_PRIME = 0x100000001B3
 _MASK = 0xFFFFFFFFFFFFFFFF
 
+# Emails are matched from the start of a word only, without "@" in either
+# part: "\S+@\S+" backtracks cubically on text like "@@@…".
 _NUMBERS = re.compile(
     r"\b0x[0-9a-fA-F]+\b|\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b|"
-    r"\b[0-9a-fA-F]{16,}\b|\d+(?:\.\d+)?|\S+@\S+\.\w+"
+    r"\b[0-9a-fA-F]{16,}\b|\d+(?:\.\d+)?|(?<![^\s@])[^\s@]+@[^\s@]+\.\w+"
 )
 _LINE_SUFFIX = re.compile(r":\d+(?::\d+)?$")
 _TOP_FRAMES = 5
 _LRU = 1024
+#: Characters of a message the fingerprint reads.
+_MAX_MESSAGE = 1024
 
 
 def fnv1a(text: str) -> str:
@@ -41,8 +45,8 @@ def fnv1a(text: str) -> str:
 
 
 def template(message: str) -> str:
-    """A message with numbers, hex, UUIDs and emails replaced."""
-    return _NUMBERS.sub("<*>", message)
+    """A message (its start) with numbers, hex, UUIDs and emails replaced."""
+    return _NUMBERS.sub("<*>", message[:_MAX_MESSAGE])
 
 
 def fingerprint(event: dict[str, Any]) -> str:
@@ -97,6 +101,9 @@ class Limiter:
         self.enabled = enabled
         self._issues: OrderedDict[str, _Bucket] = OrderedDict()
         self._global = _Bucket(global_per_minute, 0.0)
+        self._lock = threading.Lock()
+
+    def after_fork(self) -> None:
         self._lock = threading.Lock()
 
     def allow(self, fp: str, now: float) -> tuple[bool, dict[str, Any] | None]:

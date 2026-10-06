@@ -12,6 +12,7 @@ import linecache
 import os
 import re
 import reprlib
+import stat
 import sys
 import time
 from collections.abc import Iterable, Iterator, Mapping
@@ -35,6 +36,8 @@ LOCALS_BUDGET_SECONDS = 0.005
 #: Local variables kept per frame.
 MAX_LOCALS = 50
 CONTEXT_LINES = 5
+#: Source files larger than this are not read for context lines.
+MAX_SOURCE_BYTES = 10 << 20
 
 _EXTERNAL = re.compile(r"[\\/](?:dist|site)-packages[\\/]")
 
@@ -199,11 +202,11 @@ def serialize_frame(frame: FrameType, tb_lineno: int | None, o: Options, budget:
     if app is not None:
         rv["in_app"] = app
     if o.include_local_variables and app and budget is not None and budget.left():
-        rv["vars"] = _locals(frame, o.max_value_length)
+        rv["vars"] = _locals(frame, o.max_value_length, budget)
     return rv
 
 
-def _locals(frame: FrameType, limit: int) -> dict[str, Any]:
+def _locals(frame: FrameType, limit: int, budget: _Budget) -> dict[str, Any]:
     r = _bounded_repr(limit)
     out: dict[str, str] = {}
     try:
@@ -211,6 +214,8 @@ def _locals(frame: FrameType, limit: int) -> dict[str, Any]:
     except Exception:
         return out
     for name, value in items[:MAX_LOCALS]:
+        if not budget.left():  # a slow __repr__ doesn't hold the caller up
+            break
         if name.startswith("__") and name.endswith("__"):
             continue
         try:
@@ -371,12 +376,13 @@ def current_stacktrace(o: Options) -> dict[str, Any]:
     frames: list[dict[str, Any]] = []
     budget = _Budget()
     f: FrameType | None = inspect.currentframe()
-    while f is not None:
+    # Newest first, up to the frames kept.
+    while f is not None and not (o.max_stack_frames and len(frames) >= o.max_stack_frames):
         if not should_hide_frame(f):
             frames.append(serialize_frame(f, None, o, budget))
         f = f.f_back
     frames.reverse()
-    return {"frames": frames[-o.max_stack_frames :]}
+    return {"frames": frames}
 
 
 def iter_event_frames(event: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -395,6 +401,16 @@ def _iter_stacktraces(event: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 yield st
 
 
+def _source_lines(path: str) -> list[str]:
+    """A file's lines (linecache), unless it isn't a regular file (a FIFO
+    would block, a device never end) or is too large to read."""
+    if path not in linecache.cache:
+        st = os.stat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_SOURCE_BYTES:
+            return []
+    return linecache.getlines(path)
+
+
 def add_source_context(event: dict[str, Any], max_length: int) -> None:
     """Adds lines around each frame (read from disk, cached), on the
     delivery side so the caller never waits on file I/O."""
@@ -403,7 +419,7 @@ def add_source_context(event: dict[str, Any], max_length: int) -> None:
         if not path or not isinstance(lineno, int) or "context_line" in frame:
             continue
         try:
-            lines = linecache.getlines(path)
+            lines = _source_lines(str(path))
         except Exception:
             continue
         idx = lineno - 1

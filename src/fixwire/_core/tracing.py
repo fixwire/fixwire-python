@@ -26,11 +26,15 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from fixwire._core.event_builder import safe_str
+
 if TYPE_CHECKING:
     from fixwire.types import SamplingContext, TracesSampler
 
 #: Spans kept per segment; past it they're dropped and counted.
 MAX_SPANS_PER_SEGMENT = 1000
+#: Bytes of incoming baggage passed on (W3C's limit).
+MAX_BAGGAGE = 8192
 
 _TRACEPARENT = re.compile(r"^\s*00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})\s*$")
 
@@ -79,8 +83,17 @@ class PropagationContext:
             ctx.trace_id, ctx.parent_span_id = m.group(1), m.group(2)
             ctx.sampled = bool(int(m.group(3), 16) & 1)
             ctx.tracestate = _header(h, "tracestate")
-        ctx.baggage = _header(h, "baggage")
+        ctx.baggage = _cap_baggage(_header(h, "baggage"))
         return ctx
+
+
+def _cap_baggage(value: str) -> str:
+    """Incoming baggage within W3C's limit (ASCII, so characters are
+    bytes): the members that fit."""
+    if len(value) <= MAX_BAGGAGE:
+        return value
+    cut = value.rfind(",", 0, MAX_BAGGAGE + 1)
+    return value[:cut].rstrip() if cut > 0 else ""
 
 
 def _header(headers: dict[str, Any], name: str) -> str:
@@ -109,8 +122,8 @@ def _attribute(value: Any) -> Any:
         return value
     if isinstance(value, (list, tuple)):
         items = cast("list[object]", value)
-        return [v if isinstance(v, (str, bool, int, float)) else str(v) for v in items]
-    return str(value)
+        return [v if isinstance(v, (str, bool, int, float)) else safe_str(v) for v in items]
+    return safe_str(value)
 
 
 class Span:

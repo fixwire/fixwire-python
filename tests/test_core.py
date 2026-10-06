@@ -1,15 +1,18 @@
 """The sans-IO core: DSNs, the event builder, scopes, budgets, delivery."""
 
 import asyncio
+import os
 import sys
 import threading
+import time
 
 import pytest
 
 from fixwire._core import event_builder, scope
-from fixwire._core.delivery import MAX_ATTEMPTS, Delivery, Outbound, parse_rate_limits
+from fixwire._core.delivery import MAX_ATTEMPTS, MAX_WAIT, Delivery, Outbound, parse_rate_limits
 from fixwire._core.dsn import BadDsn, Dsn
 from fixwire._core.limiter import Limiter, fingerprint, template
+from fixwire._core.serializer import CIRCULAR, Serializer
 
 
 def test_dsn():
@@ -177,6 +180,68 @@ def test_fingerprint_ignores_lines_and_numbers():
         {"message": "order 9 failed for c@d.io"}
     )
     assert template("id 0xdeadbeef, 9ec79c33-ec99-42ab-8353-589fcb2e04dc") == "id <*>, <*>"
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["@" * 100_000, "a" * 50_000 + "@" + "a" * 50_000, "a@" * 50_000, "x " * 50_000],
+    ids=["at signs", "one at sign", "at pairs", "words"],
+)
+def test_fingerprints_of_hostile_messages_are_cheap(message):
+    # On the caller's thread: "\S+@\S+" took 43 s for 4,000 "@".
+    started = time.perf_counter()
+    fingerprint({"message": message})
+    assert time.perf_counter() - started < 0.1
+
+
+def test_server_waits_are_clamped():
+    # A Retry-After past what a timer takes (or infinite) once stopped the thread.
+    for value in ("inf", "1e400", "99999999999", "nan", "Wed, 21 Oct 2015 07:28:00 GMT"):
+        d = Delivery(rng=lambda: 0.0)
+        d.offer(req(b"x"), 0.0)
+        assert d.on_response(d.next(0.0), 429, {"retry-after": value}, 0.0).retry
+        assert d.wake_at() <= MAX_WAIT and d.paused_until("error") <= MAX_WAIT
+    limits = parse_rate_limits("inf:log, 1e12:span, nan:file, -5:error", 100.0)
+    assert limits == {"span": 100.0 + MAX_WAIT, "error": 100.0}
+
+
+def test_serializer_cuts_cycles_and_reads_only_what_it_keeps():
+    s = Serializer(16)
+    looped = []
+    looped.extend([looped] * 100)  # unrolled to the depth limit: 100^10 values
+    started = time.perf_counter()
+    assert s(looped) == [CIRCULAR] * 100
+    node = {"name": "a"}
+    node["self"] = node
+    cut = {"name": "a", "self": CIRCULAR}
+    assert s({"node": node, "again": node}) == {"node": cut, "again": cut}, "shared, not cyclic: both kept"
+    assert s(list(range(1_000_000))) == list(range(100))
+    assert s(b"\xe2\x82\xac" * 1_000_000) == "€" * 13 + "..."
+    assert time.perf_counter() - started < 0.5
+
+
+def test_a_message_stack_stops_at_the_frames_kept(monkeypatch):
+    serialized = []
+    serialize = event_builder.serialize_frame
+    monkeypatch.setattr(event_builder, "serialize_frame", lambda *a: serialized.append(1) or serialize(*a))
+
+    def recurse(n):
+        return (
+            event_builder.current_stacktrace(event_builder.Options(max_stack_frames=10)) if n == 0 else recurse(n - 1)
+        )
+
+    frames = recurse(200)["frames"]
+    assert len(frames) == 10 and frames[-1]["function"] == "recurse"
+    assert len(serialized) == 10, "the frames thrown away are never serialized"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_source_context_reads_regular_files_only(tmp_path):
+    fifo = str(tmp_path / "app.py")
+    os.mkfifo(fifo)  # opening it would block until a writer comes
+    event = {"exception": {"values": [{"stacktrace": {"frames": [{"abs_path": fifo, "lineno": 1}]}}]}}
+    event_builder.add_source_context(event, 100)
+    assert "context_line" not in event["exception"]["values"][0]["stacktrace"]["frames"][0]
 
 
 def req(body, category="error"):

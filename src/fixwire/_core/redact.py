@@ -11,6 +11,7 @@ scripts, and whitespace classes are spelled out (RE2's ``\\s`` has no ``\\v``).
 
 from __future__ import annotations
 
+import bisect
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -292,9 +293,9 @@ def _credential_like(v: str) -> bool:
     return any("A" <= c <= "Z" for c in rest) and any("a" <= c <= "z" for c in rest)
 
 
-# Scanners for two of the server's patterns: the same leftmost matches in
+# Scanners for three of the server's patterns: the same leftmost matches in
 # linear time (as regular expressions here they backtrack quadratically on
-# text like "a.a.a….://" or many BEGIN lines without an END).
+# text like "a.a.a….://", many BEGIN lines without an END or "eyJ-eyJ-…").
 
 _KEY_LABEL = "PRIVATE KEY-----"
 
@@ -378,6 +379,42 @@ def _url_credential_spans(s: str) -> list[Span]:
     return out
 
 
+_JWT_RUN = _re(r"[A-Za-z0-9_-]*")
+
+
+def _jwt_run_end(s: str, i: int) -> int:
+    m = _JWT_RUN.match(s, i)
+    return m.end() if m else i
+
+
+def _jwt_spans(s: str) -> list[Span]:
+    """The server's ``\\beyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}``
+    in linear time. Each part runs to the end of its run of base64url
+    characters, so every start in one run shares the rest of the match:
+    when one fails, the run's later starts fail too and are skipped."""
+    out: list[Span] = []
+    n = len(s)
+    i = s.find("eyJ")
+    while i >= 0:
+        if i > 0 and s[i - 1] in _WORD:
+            i = s.find("eyJ", i + 1)
+            continue
+        head = _jwt_run_end(s, i + 3)
+        end = -1
+        if head - i >= 11 and head < n and s[head] == "." and s.startswith("eyJ", head + 1):
+            payload = _jwt_run_end(s, head + 4)
+            if payload - head >= 12 and payload < n and s[payload] == ".":
+                signature = _jwt_run_end(s, payload + 1)
+                if signature - payload >= 9:
+                    end = signature
+        if end >= 0:
+            out.append((i, end))
+            i = s.find("eyJ", end)
+        else:
+            i = s.find("eyJ", head)
+    return out
+
+
 _REGISTRY = (
     _Detector(
         "private_key",
@@ -422,7 +459,7 @@ _REGISTRY = (
         True,
         _re(r"\bsk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_\-]{40,}|[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20})"),
     ),
-    _Detector("jwt", ("eyJ",), True, _re(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    _Detector("jwt", ("eyJ",), True, scan=_jwt_spans),
     _Detector(
         "fixwire_secret_key", ("_sk_live_", "_sk_test_"), True, _re(r"\b[a-z]{2,4}_sk_(?:live|test)_[0-9A-Za-z]{38}\b")
     ),
@@ -535,6 +572,10 @@ class Redactor:
         """Non-overlapping findings, leftmost first; when two overlap, the
         earlier detector wins."""
         out: list[Finding] = []
+        # The findings' (start, end), sorted: they don't overlap, so their
+        # ends are sorted too and only the last one starting before a new
+        # finding's end can overlap it.
+        taken: list[Span] = []
         lower: str | None = None
         for d in self._detectors:
             if d.prefilter:
@@ -550,8 +591,10 @@ class Redactor:
             for start, end in d.spans(s):
                 if d.validate is not None and not d.validate(s[start:end]):
                     continue
-                if any(start < f.end and f.start < end for f in out):
+                i = bisect.bisect_left(taken, (end, -1))
+                if i and taken[i - 1][1] > start:
                     continue
+                taken.insert(i, (start, end))
                 out.append(Finding(d.name, start, end))
         out.sort(key=lambda f: f.start)
         return out

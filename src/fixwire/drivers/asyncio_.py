@@ -107,11 +107,12 @@ class AsyncioDriver:
 
     async def _send(self, item: Outbound) -> None:
         try:
-            status, headers = await self.send(self.core.url(item), item.body, self.core.headers(item))
-        except Exception as e:
-            self.delivery.on_error(item, time.monotonic(), type(e).__name__)
-        else:
-            d = self.delivery.on_response(item, status, headers, time.monotonic())
+            try:
+                status, headers = await self.send(self.core.url(item), item.body, self.core.headers(item))
+            except Exception as e:
+                d = self.delivery.on_error(item, time.monotonic(), type(e).__name__)
+            else:
+                d = self.delivery.on_response(item, status, headers, time.monotonic())
             if not d.retry and item.spool_id is not None:
                 await self.loop.run_in_executor(self._encoder, self.core.spool_done, item)
             if d.dropped and self.core.options.debug:

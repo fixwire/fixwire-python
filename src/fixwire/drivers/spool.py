@@ -47,7 +47,10 @@ class Spool:
     def __init__(
         self, path: str, max_items: int = MAX_ITEMS, max_bytes: int = MAX_BYTES, ttl: float = TTL_SECONDS
     ) -> None:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # The requests hold event data: only this user may read them (SQLite
+        # gives its -wal and -shm files the database file's mode).
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+        os.close(os.open(path, os.O_RDWR | os.O_CREAT, 0o600))
         self.path = path
         self.max_items, self.max_bytes, self.ttl = max_items, max_bytes, ttl
         self._lock = threading.Lock()

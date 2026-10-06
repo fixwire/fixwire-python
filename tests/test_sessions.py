@@ -6,7 +6,7 @@ import re
 import pytest
 
 import fixwire
-from fixwire._core.sessions import Aggregates, hash_identity
+from fixwire._core.sessions import MAX_BUCKETS, Aggregates, hash_identity
 from fixwire.integrations.wsgi import FixwireMiddleware
 
 
@@ -121,3 +121,12 @@ def test_aggregates_send_once_a_minute():
     assert aggregates is not None and len(aggregates) == 3 and len(agg) == 0
     assert aggregates[0] == {"started": "1970-01-01T00:16:00Z", "did": hash_identity("u"), "exited": 1}
     assert agg.take() is None
+
+
+def test_aggregates_count_a_bounded_number_of_users_apart():
+    agg = Aggregates()
+    for i in range(MAX_BUCKETS + 100):
+        agg.record("ok", "user-%d" % i, 1000.0)
+    aggregates = agg.take()
+    assert aggregates is not None and len(aggregates) == MAX_BUCKETS + 1, "the rest without a user"
+    assert sum(a["exited"] for a in aggregates) == MAX_BUCKETS + 100, "every request still counts"

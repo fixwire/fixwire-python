@@ -1,8 +1,13 @@
 """The offline spool: requests survive outages and restarts."""
 
+import asyncio
+import os
+import stat
 import time
 
-from fixwire import Client
+import pytest
+
+from fixwire import AsyncClient, Client
 from fixwire._core.delivery import Outbound
 from fixwire.drivers import spool as spool_mod
 from fixwire.drivers.spool import Spool
@@ -56,6 +61,32 @@ def test_an_outage_and_a_restart_lose_nothing(ingest, tmp_path, monkeypatch):
     second.close()
     assert "written during the outage" in [e.get("message") for e in ingest.events()]
     assert ingest.requests[0]["path"] == "/v1/logs"
+    assert Spool(path).count() == 0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_the_spool_is_readable_by_its_user_only(tmp_path):
+    path = tmp_path / "cache" / "spool.db"
+    Spool(str(path)).put(Outbound("/v1/logs", "application/json", b"x", "error"))
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(path.parent).st_mode) == 0o700
+    wal = path.with_name("spool.db-wal")
+    assert not wal.exists() or stat.S_IMODE(os.stat(wal).st_mode) == 0o600
+
+
+def test_requests_given_up_on_leave_the_spool(tmp_path, monkeypatch):
+    import fixwire._core.delivery as delivery
+
+    monkeypatch.setattr(delivery, "MAX_ATTEMPTS", 1)
+    path = str(tmp_path / "spool.db")
+
+    async def main():
+        # Nothing listens there: the one attempt fails and the request is dropped.
+        async with AsyncClient("http://k@127.0.0.1:9", offline=path, default_integrations=False) as client:
+            client.capture_message("given up")
+            assert await client.aflush(5)
+
+    asyncio.run(main())
     assert Spool(path).count() == 0
 
 

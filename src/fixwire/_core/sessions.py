@@ -14,6 +14,9 @@ from typing import Any
 
 #: Seconds between sends of request sessions while running.
 INTERVAL = 60.0
+#: Minutes and users counted apart until a send; past it, requests count
+#: without their user, so a send stays under the ingest's 1 MB.
+MAX_BUCKETS = 5000
 
 _COLUMNS = {"ok": 0, "errored": 1, "crashed": 2}
 
@@ -57,10 +60,15 @@ class Aggregates:
         with self._lock:
             return len(self._buckets)
 
+    def after_fork(self) -> None:
+        self._lock = threading.Lock()
+
     def record(self, status: str, user: str | None, at: float) -> bool:
         """Counts one request; True the first time a send is due."""
         key = (int(at // 60) * 60, hash_identity(user))
         with self._lock:
+            if key not in self._buckets and len(self._buckets) >= MAX_BUCKETS:
+                key = (key[0], None)  # counted, without its user
             self._buckets.setdefault(key, [0, 0, 0])[_COLUMNS.get(status, 0)] += 1
             if self._since is None:
                 self._since = at

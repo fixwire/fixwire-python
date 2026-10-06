@@ -1,10 +1,11 @@
 """Turns event values into JSON-safe data within limits: strings capped at
-max_value_length, containers capped in depth and breadth, everything else
-through a bounded repr."""
+max_value_length, containers capped in depth and breadth, cycles cut,
+everything else through a bounded repr."""
 
 from __future__ import annotations
 
 import datetime
+import itertools
 import reprlib
 import uuid
 from collections.abc import Iterable
@@ -12,6 +13,8 @@ from typing import Any, cast
 
 MAX_DEPTH = 10
 MAX_BREADTH = 100
+#: A container inside itself (as the JavaScript SDK writes it).
+CIRCULAR = "[Circular ~]"
 
 _PRIMITIVES = (bool, int, float, type(None))
 
@@ -29,6 +32,10 @@ class Serializer:
         self._repr.maxstring = self._repr.maxother = max(16, max_value_length)
 
     def __call__(self, value: Any, depth: int = 0) -> Any:
+        return self._value(value, depth, set())
+
+    def _value(self, value: Any, depth: int, parents: set[int]) -> Any:
+        """``parents``: the ids of the containers ``value`` is in."""
         if isinstance(value, str):
             return clip(value, self.limit)
         if isinstance(value, _PRIMITIVES):
@@ -37,22 +44,30 @@ class Serializer:
             return value
         if depth >= MAX_DEPTH:
             return clip(self._safe_repr(value), self.limit)
-        if isinstance(value, dict):
-            out: dict[str, Any] = {}
-            for i, (k, v) in enumerate(cast("dict[object, object]", value).items()):
-                if i >= MAX_BREADTH:
-                    break
-                out[k if isinstance(k, str) else self._safe_repr(k)] = self(v, depth + 1)
-            return out
-        if isinstance(value, (list, tuple, set, frozenset)):
-            items = cast("Iterable[object]", value)
-            return [self(v, depth + 1) for i, v in enumerate(items) if i < MAX_BREADTH]
+        if isinstance(value, (dict, list, tuple, set, frozenset)):
+            key = id(cast("object", value))
+            if key in parents:
+                return CIRCULAR
+            parents.add(key)
+            try:
+                if isinstance(value, dict):
+                    out: dict[str, Any] = {}
+                    items = cast("dict[object, object]", value).items()
+                    for k, v in itertools.islice(items, MAX_BREADTH):
+                        out[k if isinstance(k, str) else self._safe_repr(k)] = self._value(v, depth + 1, parents)
+                    return out
+                values = itertools.islice(cast("Iterable[object]", value), MAX_BREADTH)
+                return [self._value(v, depth + 1, parents) for v in values]
+            finally:
+                parents.discard(key)
         if isinstance(value, (datetime.datetime, datetime.date)):
             return value.isoformat()
         if isinstance(value, uuid.UUID):
             return str(value)
         if isinstance(value, bytes):
-            return clip(value.decode("utf-8", "replace"), self.limit)
+            # Only what can survive the cap is decoded (4 bytes a character at most).
+            head = value[: self.limit * 4 + 4] if self.limit else value
+            return clip(head.decode("utf-8", "replace"), self.limit)
         return clip(self._safe_repr(value), self.limit)
 
     def _safe_repr(self, value: Any) -> str:

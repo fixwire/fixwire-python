@@ -133,6 +133,13 @@ class Core:
             except Exception:
                 logger.exception("fixwire: could not open the offline spool; continuing without it")
 
+    def after_fork(self) -> None:
+        """In a forked child: new locks (one held by another thread at the
+        fork would stay held) and an empty queue (the parent sends it)."""
+        self.queue = EventQueue(self.options.max_queue_size)
+        self.limiter.after_fork()
+        self.sessions.after_fork()
+
     # Caller side.
 
     def event_from_exception(

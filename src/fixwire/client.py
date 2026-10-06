@@ -65,8 +65,8 @@ class Client:
         Returns its id, or None when it was dropped."""
         if not self.enabled:
             return None
-        self.core.mark_session(cast("dict[str, Any]", event))
         try:
+            self.core.mark_session(cast("dict[str, Any]", event))
             prepared = self.core.prepare(cast("dict[str, Any]", event), hint)
         except Exception:
             logger.exception("fixwire: could not prepare an event")
@@ -89,6 +89,9 @@ class Client:
         except ValueError as e:
             warnings.warn(str(e), stacklevel=2)
             return None
+        except Exception:  # e.g. an exception whose own attributes raise
+            logger.exception("fixwire: could not build an event from an exception")
+            return None
         exc = hint.get("exc_info", (None, None, None))[1]
         # The same exception object reported twice (explicitly, then by an
         # integration) is sent once.
@@ -105,7 +108,12 @@ class Client:
     def capture_segment(self, segment: Span) -> None:
         """Queues a finished, sampled segment and its spans."""
         if self.enabled:
-            self._submit(self.core.segment_payload(segment))
+            try:
+                payload = self.core.segment_payload(segment)
+            except Exception:  # e.g. an attribute whose str() raises
+                logger.exception("fixwire: could not record a segment")
+                return
+            self._submit(payload)
 
     def capture_message(self, message: str, level: Level = "info", stacktrace: bool = False) -> str | None:
         """Reports a message; ``stacktrace=True`` adds where it was called."""
@@ -299,8 +307,7 @@ class AsyncClient(Client):
         if not driver.submit(event):
             # The loop is gone: deliver from a thread, with what it left.
             thread = self._thread()
-            for item in driver.take_leftovers():
-                thread.delivery.offer(item, 0.0)
+            thread.adopt(driver.take_leftovers())
             thread.submit(event)
 
     def _on_loop_thread(self) -> bool:
@@ -350,8 +357,7 @@ class AsyncClient(Client):
         events = self.core.queue.drain()
         if leftovers or events:
             thread = self._thread()
-            for item in leftovers:
-                thread.delivery.offer(item, 0.0)
+            thread.adopt(leftovers)
             for e in events:
                 thread.submit(e)
 

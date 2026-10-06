@@ -2,12 +2,19 @@
 
 import asyncio
 import logging
+import os
+import signal
 import threading
+import time
+import warnings
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
 import fixwire
 from fixwire import AsyncClient, Client
+from fixwire.transport.httpx_ import HttpxSender
+from fixwire.transport.urllib3_ import Urllib3Sender
 
 
 def charge(card):
@@ -221,6 +228,123 @@ def test_logging_integration(ingest):
     assert event["message"] == "charge failed for order ord_1"  # the record's body
     assert event["exception"]["values"][-1]["mechanism"]["type"] == "logging"
     assert event["breadcrumbs"]["values"][-1]["message"] == "cart has 3 items"
+
+
+def test_logging_while_reporting_is_not_reported_again(ingest):
+    hooks = logging.getLogger("shop.hooks")
+
+    def before_send(event, hint):
+        hooks.error("before_send saw %s", event.get("logentry", {}).get("formatted"))
+        return event
+
+    fixwire.init(ingest.dsn, before_send=before_send)
+    logging.getLogger("shop").error("charge failed")
+    assert fixwire.flush(5)
+    assert [e["message"] for e in ingest.events()] == ["charge failed"], "no recursion through before_send"
+
+
+class Unreadable(Exception):
+    @property
+    def message(self):
+        raise KeyError("message")
+
+
+def test_an_exception_that_breaks_when_read_is_not_raised_into_the_app(ingest):
+    with Client(ingest.dsn, default_integrations=False) as client:
+        try:
+            raise Unreadable("x")
+        except Unreadable:
+            assert client.capture_exception() is None
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork()")
+def test_a_forked_child_does_not_wait_on_locks_held_at_the_fork(ingest):
+    client = Client(ingest.dsn, default_integrations=False)
+    client.capture_message("parent")
+    assert client.flush(5)
+    # As if other threads were inside the queue and the budgets at the fork.
+    with client.core.queue._lock, client.core.limiter._lock, warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)  # fork() while threads run
+        pid = os.fork()
+        if pid == 0:
+            try:
+                client.capture_message("child")
+                os._exit(0 if client.flush(5) else 1)
+            finally:
+                os._exit(2)
+    deadline = time.monotonic() + 10
+    while not os.waitpid(pid, os.WNOHANG)[0] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if time.monotonic() >= deadline:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        pytest.fail("the child hung on a lock held at the fork")
+    client.close()
+    assert sorted(e["message"] for e in ingest.events()) == ["child", "parent"]
+
+
+def test_answers_are_read_bounded_and_redirects_are_not_followed():
+    # A redirect would take the key to another host; a huge answer was read whole.
+    elsewhere: list[str | None] = []
+
+    class Other(BaseHTTPRequestHandler):
+        def do_POST(self):
+            elsewhere.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    class Hostile(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            if self.path == "/v1/moved":
+                self.send_response(307)
+                self.send_header("Location", "http://127.0.0.1:%d/v1/logs" % other.server_address[1])
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(1 << 30))
+            self.end_headers()
+            try:
+                for _ in range(1 << 10):
+                    self.wfile.write(b"x" * (1 << 20))
+            except OSError:
+                pass  # the SDK stopped reading
+
+        def log_message(self, *args):
+            pass
+
+    servers = [ThreadingHTTPServer(("127.0.0.1", 0), h) for h in (Other, Hostile)]
+    other, hostile = servers
+    for s in servers:
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % hostile.server_address[1]
+    headers = {"Authorization": "Bearer publickey"}
+
+    async def via_httpx():
+        send = HttpxSender(5)
+        try:
+            return (await send(base + "/v1/moved", b"{}", headers))[0], (await send(base + "/v1/logs", b"{}", headers))[
+                0
+            ]
+        finally:
+            await send.aclose()
+
+    try:
+        send = Urllib3Sender(5)
+        started = time.perf_counter()
+        assert send(base + "/v1/moved", b"{}", headers)[0] == 307
+        assert send(base + "/v1/logs", b"{}", headers)[0] == 200
+        assert asyncio.run(via_httpx()) == (307, 200)
+        assert time.perf_counter() - started < 5, "a 1 GB answer isn't read"
+        assert elsewhere == []
+    finally:
+        for s in servers:
+            s.shutdown()
+            s.server_close()
 
 
 def test_no_dsn_is_a_noop():

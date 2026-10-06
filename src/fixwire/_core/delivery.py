@@ -15,6 +15,7 @@ are the first to go when it is full.
 
 from __future__ import annotations
 
+import math
 import random
 from collections import deque
 from collections.abc import Callable
@@ -25,6 +26,8 @@ BACKOFF_MAX = 300.0
 MAX_ATTEMPTS = 6
 #: Seconds a 429 without Retry-After waits.
 DEFAULT_RETRY_AFTER = 60.0
+#: The longest a Retry-After or a rate limit holds data back, in seconds.
+MAX_WAIT = 24 * 3600.0
 
 
 @dataclass
@@ -61,7 +64,7 @@ def parse_rate_limits(header: str, now: float) -> dict[str, float]:
         if not sep:
             continue
         try:
-            until = now + float(seconds)
+            until = now + _seconds(seconds)
         except ValueError:
             continue
         for cat in [c.strip() for c in categories.split(";") if c.strip()] or [""]:
@@ -69,9 +72,18 @@ def parse_rate_limits(header: str, now: float) -> dict[str, float]:
     return out
 
 
+def _seconds(value: str) -> float:
+    """A server's wait in seconds, from 0 to MAX_WAIT; ValueError unless
+    a finite number."""
+    seconds = float(value)
+    if not math.isfinite(seconds):
+        raise ValueError("not a finite number of seconds: %r" % value)
+    return min(max(0.0, seconds), MAX_WAIT)
+
+
 def _retry_after(value: str | None) -> float | None:
     try:
-        return max(0.0, float(value)) if value else None
+        return _seconds(value) if value else None
     except ValueError:
         return None
 

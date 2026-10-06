@@ -11,7 +11,7 @@ import os
 import threading
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from fixwire._core.delivery import Delivery, Outbound
@@ -88,18 +88,27 @@ class ThreadDriver:
         wake = self.delivery.wake_at()
         return wake is not None and wake <= time.monotonic()
 
+    def adopt(self, items: Iterable[Outbound], now: float = 0.0) -> None:
+        """Queues encoded requests (what a stopped event loop left). The
+        delivery is only touched under the lock: flush() reads it from other
+        threads while this one sends."""
+        with self._cond:
+            for out in items:
+                self.delivery.offer(out, now)
+
     def _step(self) -> None:
         now = time.monotonic()
         if not self._spool_loaded:
             self._spool_loaded = True
-            for out in self.core.spool_load():
-                self.delivery.offer(out, now)
+            self.adopt(self.core.spool_load(), now)
         for event in self.core.queue.drain():
-            for out in self.core.encode(event):
+            outs = self.core.encode(event)
+            for out in outs:
                 self.core.spool_put(out)
-                self.delivery.offer(out, now)
+            self.adopt(outs, now)
         while True:
-            item = self.delivery.next(time.monotonic())
+            with self._cond:
+                item = self.delivery.next(time.monotonic())
             if item is None:
                 return
             self._send(item)
@@ -108,9 +117,11 @@ class ThreadDriver:
         try:
             status, headers = self.send(self.core.url(item), item.body, self.core.headers(item))
         except Exception as e:  # network errors are retried
-            d = self.delivery.on_error(item, time.monotonic(), type(e).__name__)
+            with self._cond:
+                d = self.delivery.on_error(item, time.monotonic(), type(e).__name__)
         else:
-            d = self.delivery.on_response(item, status, headers, time.monotonic())
+            with self._cond:
+                d = self.delivery.on_response(item, status, headers, time.monotonic())
         if not d.retry:
             self.core.spool_done(item)
         if d.dropped and self.core.options.debug:
@@ -140,13 +151,15 @@ class ThreadDriver:
             return True
 
     def close(self, timeout: float | None = None) -> None:
+        deadline = None if timeout is None else time.monotonic() + timeout
         self.flush(timeout)
         with self._cond:
             self._stopping = True
             self._cond.notify_all()
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout)
+            # Within what flush() left of the timeout.
+            thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
         closer = getattr(self.send, "close", None)
         if closer:
             closer()
@@ -155,8 +168,13 @@ class ThreadDriver:
         self._cond = threading.Condition()
         self._thread = None
         self._busy = self._stopping = self._kicked = False
-        self.core.queue.clear()
+        # A lock another thread held at the fork stays held in the child:
+        # the core's are made anew (the queue empty: the parent sends it).
+        self.core.after_fork()
         self.delivery = Delivery()
+        reset = getattr(self.send, "after_fork", None)
+        if reset:
+            reset()
         self._spool_loaded = False
         if self.core.spool is not None:
             self.core.spool.reopen()

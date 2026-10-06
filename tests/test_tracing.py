@@ -3,7 +3,7 @@
 import pytest
 
 import fixwire
-from fixwire._core.tracing import PropagationContext, keep, sample_rand
+from fixwire._core.tracing import MAX_BAGGAGE, PropagationContext, keep, sample_rand
 
 TRACE, PARENT = "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7"
 
@@ -117,6 +117,29 @@ def test_continuing_and_propagating_traces(ingest):
     raw = {s["spanId"]: s for s, _ in ingest.otlp_spans()}
     assert raw[segment["span_id"]]["flags"] == 0x301, "a remote parent"
     assert ingest.events()[0]["contexts"]["trace"]["trace_id"] == TRACE
+
+
+def test_incoming_baggage_is_passed_on_within_the_w3c_limit():
+    members = ",".join("k%d=%s" % (i, "v" * 90) for i in range(200))  # 19 KB from a caller
+    ctx = PropagationContext.from_headers({"baggage": members})
+    assert 0 < len(ctx.baggage) <= MAX_BAGGAGE and members.startswith(ctx.baggage + ","), "whole members"
+    assert PropagationContext.from_headers({"baggage": "a=1,b=2"}).baggage == "a=1,b=2"
+
+
+def test_an_attribute_whose_str_raises_neither_breaks_the_app_nor_loses_the_segment(ingest):
+    class Odd:
+        def __str__(self):
+            raise RuntimeError("no str")
+
+        def __repr__(self):
+            return "Odd()"
+
+    fixwire.init(ingest.dsn, traces_sample_rate=1.0, default_integrations=False)
+    with fixwire.start_span("job") as span:
+        span.set_attribute("odd", Odd())
+    assert fixwire.flush(5)
+    [segment] = span_items(ingest)
+    assert attr(segment, "odd") == "Odd()"
 
 
 def test_root_decisions_come_from_the_trace_id(ingest):

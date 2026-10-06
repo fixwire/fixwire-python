@@ -4,6 +4,8 @@ server's scrubber and this port must agree on every case."""
 
 import json
 import pathlib
+import random
+import re
 import time
 
 import pytest
@@ -61,14 +63,32 @@ BEGIN = "-----BEGIN "  # split, so no scanner sees a whole key
         "a." * 50_000 + "://",
         (BEGIN + "RSA PRIVATE KEY-----\n") * 3_000,
         "x://u:" * 20_000,
+        "eyJ-" * 50_000,
+        "a@b.co " * 20_000,
     ],
     # Short names: pytest puts a test's name in the environment, which Windows caps at 32 KB.
-    ids=["a URL scheme that never ends", "BEGIN lines without an END", "credentials that never end"],
+    ids=[
+        "a URL scheme that never ends",
+        "BEGIN lines without an END",
+        "credentials that never end",
+        "tokens that never end",
+        "many findings",
+    ],
 )
 def test_hostile_text_is_masked_in_linear_time(text: str) -> None:
     started = time.perf_counter()
     Redactor().mask(text)
     assert time.perf_counter() - started < 0.5
+
+
+def test_tokens_are_found_where_the_servers_expression_finds_them() -> None:
+    # The JWT scanner against the server's pattern (same leftmost matches).
+    server = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", re.ASCII)
+    rng = random.Random(7)
+    pieces = ["eyJ", "eyJ", ".eyJ", "abcdefgh", "a", "Z9", "_", "-", ".", " ", "x", "e", "yJ"]
+    for _ in range(5_000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 24)))
+        assert Redactor(detectors=["jwt"]).mask(text)[0] == server.sub("[REDACTED:jwt]", text), text
 
 
 @pytest.mark.parametrize(
