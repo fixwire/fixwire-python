@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # on Windows too
+
+env:
+  # What the tests drive: the frameworks the integrations support, the AI
+  # clients the wrappers trace, and OpenTelemetry (expanded unquoted, so the
+  # shell splits it into one requirement per word).
+  TEST_DEPS: >-
+    pytest>=8 urllib3>=1.26.11 httpx>=0.27 starlette>=0.40 fastapi>=0.115 django>=5.0
+    celery>=5.4 flask>=3.0 requests>=2.31 anthropic>=1.0 openai>=1.66 opentelemetry-api>=1.30
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }}, ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - { os: macos-latest, python: "3.14" }
+          - { os: windows-latest, python: "3.14" }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: ${{ matrix.python }}
+          activate-environment: true
+      - run: uv pip install -e ".[async]" $TEST_DEPS
+      - name: test (the SDK, every integration, the examples against a fake ingest)
+        run: python -m pytest -q
+
+  lowest:
+    name: Python 3.10, the oldest supported dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.10"
+          activate-environment: true
+      - run: uv pip install --resolution lowest-direct -e ".[async]" $TEST_DEPS
+      - run: python -m pytest -q
+
+  checks:
+    name: format, lint, types, licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.14"
+          activate-environment: true
+      - run: >-
+          uv pip install -e ".[async]" $TEST_DEPS types-requests "mypy>=2.4" "pyright>=1.1.414"
+          "django-stubs>=6.1" "celery-types>=0.26" "ruff==0.14.7"
+      - run: ruff format --check .
+      - run: ruff check .
+      - name: types (mypy and pyright, strict)
+        run: mypy && pyright
+      - run: python tools/license_gate.py

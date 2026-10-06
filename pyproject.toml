@@ -13,9 +13,25 @@ dependencies = ["urllib3>=1.26.11"]
 dynamic = ["version"]
 classifiers = [
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Framework :: AsyncIO",
+  "Framework :: Celery",
+  "Framework :: Django",
+  "Framework :: FastAPI",
+  "Framework :: Flask",
   "Topic :: System :: Monitoring",
+  "Typing :: Typed",
 ]
+
+[project.urls]
+Homepage = "https://fixwire.io"
+Source = "https://github.com/fixwire/fixwire-python"
+Issues = "https://github.com/fixwire/fixwire-python/issues"
+Changelog = "https://github.com/fixwire/fixwire-python/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 async = ["httpx>=0.27"]
@@ -23,7 +39,7 @@ async = ["httpx>=0.27"]
 [dependency-groups]
 dev = ["pytest>=8", "httpx>=0.27", "starlette>=0.40", "fastapi>=0.115", "django>=5.0", "celery>=5.4", "flask>=3.0", "requests>=2.31", "types-requests>=2.31",
        "mypy>=2.4", "pyright>=1.1.414", "django-stubs>=6.1", "celery-types>=0.26", "anthropic>=1.0",
-       "openai>=1.60", "opentelemetry-api>=1.30"]
+       "openai>=1.66", "opentelemetry-api>=1.30"]
 
 [tool.hatch.version]
 path = "src/fixwire/_version.py"

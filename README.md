@@ -1,5 +1,7 @@
 # fixwire
 
+[![CI](https://github.com/fixwire/fixwire-python/actions/workflows/ci.yml/badge.svg)](https://github.com/fixwire/fixwire-python/actions/workflows/ci.yml)
+
 The Fixwire SDK for Python: errors today, then traces and AI agents. A sync
 client and a native asyncio client share one sans-IO core.
 
