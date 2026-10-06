@@ -378,7 +378,7 @@ def test_source_lines_come_through_a_bounded_cache(tmp_path, monkeypatch):
     paths = []
     for i in range(5):
         paths.append(tmp_path / ("m%d.py" % i))
-        paths[-1].write_text("a = %d\nb = 2\n" % i)
+        paths[-1].write_bytes(b"a = %d\nb = 2\n" % i)  # 12 bytes, \n on Windows too
         assert context_line(paths[-1]) == "a = %d" % i
     assert list(event_builder._sources) == [str(p) for p in paths[2:]]
     big = tmp_path / "big.py"
