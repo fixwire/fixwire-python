@@ -4,6 +4,11 @@ All notable changes to the Fixwire Python SDK are listed here. Versions follow [
 Versioning](https://semver.org); before 1.0, a minor version may change the
 API.
 
+## [Unreleased]
+
+- A tool call's arguments hash reads at most the first 16,384 bytes of the arguments' JSON, and the JSON's length when it is longer, as the JavaScript SDK does (1.6 MB of JSON took the caller over 100 ms). Hashes of shorter JSON are unchanged.
+- `ai.tool()` no longer raises on arguments with a lone surrogate: the hash escapes it, as the JavaScript SDK does.
+
 ## [0.1.1] - 2026-10-06
 
 - Fingerprinting a message with many "@" no longer hangs the caller (the email pattern backtracked cubically).

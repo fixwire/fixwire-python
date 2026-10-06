@@ -23,6 +23,7 @@ import contextlib
 import functools
 import inspect
 import json
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterator, Mapping
 from typing import (
     TYPE_CHECKING,
@@ -59,6 +60,10 @@ _serialize = Serializer(MAX_AI_CONTENT)
 #: Content is kept to what redaction reads; the cut to MAX_AI_CONTENT bytes
 #: (longest recorded content attribute) comes after it, when it is sent.
 _serialize_content = Serializer(window(MAX_AI_CONTENT))
+#: The canonical JSON's bytes the arguments hash reads (the rest adds only
+#: its length): the byte loop over all of up to 1.6 MB took the caller 150 ms.
+_HASHED_BYTES = 16_384
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 class TokenUsage(TypedDict, total=False):
@@ -78,9 +83,18 @@ def _canonical(value: Any, serialize: Serializer = _serialize) -> str:
 
 
 def arguments_hash(value: Any) -> str:
-    """FNV-1a 64 of the canonical JSON (sorted keys), as 16 hex digits."""
+    """FNV-1a 64 of the canonical JSON (sorted keys), as 16 hex digits: of
+    its first 16,384 bytes of UTF-8 and, when it is longer, of its length in
+    bytes (8, little-endian). The JavaScript SDK computes the same."""
+    text = _canonical(value)
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError:  # lone surrogates: escaped, as JavaScript's JSON.stringify does
+        data = _LONE_SURROGATE.sub(lambda m: "\\u%04x" % ord(m.group()), text).encode("utf-8")
+    if len(data) > _HASHED_BYTES:
+        data = data[:_HASHED_BYTES] + len(data).to_bytes(8, "little")
     h = 0xCBF29CE484222325
-    for b in _canonical(value).encode("utf-8"):
+    for b in data:
         h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return "%016x" % h
 

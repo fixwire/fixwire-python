@@ -2,6 +2,7 @@
 streamed), content recording and the tool-arguments hash."""
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -164,6 +165,36 @@ def test_argument_hashes_match_the_javascript_sdk():
     assert ai.arguments_hash({"id": "ord_1"}) == "e665776feba25695"
     assert ai.arguments_hash({"b": 2, "a": [1, {"y": "é", "x": True}]}) == "d12b766c8a7a2cc0"
     assert ai.arguments_hash({"a": [1, {"x": True, "y": "é"}], "b": 2}) == "d12b766c8a7a2cc0"
+    # The JavaScript SDK's test checks these too. JSON over 16,384 bytes is
+    # hashed as its first 16,384 and its length; a lone surrogate is escaped.
+    for value, want in [
+        ("é" * 9000, "817acd82648064e0"),
+        ("😀" * 5000, "034a133f00c743ff"),
+        ("a" * 16_382, "cab48f29cc204e73"),  # 16,384 bytes with the quotes: all of them
+        ("a" * 16_383, "29822d3f4ff5cd07"),
+        ({"chunks": ["x" * 20_000] * 100}, "8c93db9c92660095"),  # 1.6 MB of JSON
+        ({"a": "\ud800"}, "870bca4fbe3610bd"),
+        ({"k" * 17_000: "long key"}, "5fd4d5d8c3e1e1de"),
+    ]:
+        assert ai.arguments_hash(value) == want, repr(value)[:40]
+
+
+def test_a_2_mb_argument_hashes_in_a_few_milliseconds():
+    # A hundred 20 kB strings: 1.6 MB of JSON once each is cut to 16 kB.
+    def big(last="x" * 20_000):
+        return {"chunks": ["x" * 20_000] * 99 + [last]}
+
+    args = big()
+    best = float("inf")
+    for _ in range(3):
+        started = time.perf_counter()
+        ai.arguments_hash(args)
+        best = min(best, time.perf_counter() - started)
+    assert best < 0.05, best  # all 1.6 MB through FNV in Python took over 100 ms
+    # Past the first 16 kB only the length counts: the same call hashes the
+    # same, and one whose JSON is longer or shorter differently.
+    assert ai.arguments_hash(big("y" * 20_000)) == ai.arguments_hash(args)
+    assert ai.arguments_hash(big("x")) != ai.arguments_hash(args)
 
 
 def test_an_abandoned_stream_still_ends_its_span(ingest):
