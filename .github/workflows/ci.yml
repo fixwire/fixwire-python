@@ -12,14 +12,9 @@ defaults:
   run:
     shell: bash # on Windows too
 
-env:
-  # What the tests drive: the frameworks the integrations support, the AI
-  # clients the wrappers trace, and OpenTelemetry (expanded unquoted, so the
-  # shell splits it into one requirement per word).
-  TEST_DEPS: >-
-    pytest>=8 urllib3>=1.26.11 httpx>=0.27 starlette>=0.40 fastapi>=0.115 django>=5.0
-    celery>=5.4 flask>=3.0 requests>=2.31 anthropic>=1.0 openai>=1.66 opentelemetry-api>=1.30
-
+# The tests install pyproject.toml's test group at the newest (and, once, the
+# oldest) versions it allows, so a new release of a framework breaks here
+# first; the checks run from uv.lock, as a contributor's `uv sync` does.
 jobs:
   test:
     name: Python ${{ matrix.python }}, ${{ matrix.os }}
@@ -38,7 +33,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           activate-environment: true
-      - run: uv pip install -e ".[async]" $TEST_DEPS
+      - run: uv pip install -e ".[async]" --group test
       - name: test (the SDK, every integration, the examples against a fake ingest)
         run: python -m pytest -q
 
@@ -51,7 +46,7 @@ jobs:
         with:
           python-version: "3.10"
           activate-environment: true
-      - run: uv pip install --resolution lowest-direct -e ".[async]" $TEST_DEPS
+      - run: uv pip install --resolution lowest-direct -e ".[async]" --group test
       - run: python -m pytest -q
 
   checks:
@@ -63,9 +58,8 @@ jobs:
         with:
           python-version: "3.14"
           activate-environment: true
-      - run: >-
-          uv pip install -e ".[async]" $TEST_DEPS types-requests "mypy>=2.4" "pyright>=1.1.414"
-          "django-stubs>=6.1" "celery-types>=0.26" "ruff==0.14.7"
+      - name: install from uv.lock (fails if it is out of date with pyproject.toml)
+        run: uv sync --locked --all-extras
       - run: ruff format --check .
       - run: ruff check .
       - name: types (mypy and pyright, strict)

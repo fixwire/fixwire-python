@@ -36,10 +36,16 @@ Changelog = "https://github.com/fixwire/fixwire-python/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 async = ["httpx>=0.27"]
 
+# `uv sync` installs dev, which is both; CI installs the same groups. The
+# tests drive the frameworks the integrations support, the AI clients the
+# wrappers trace and OpenTelemetry; lint adds the formatter and the type
+# checkers (django-stubs needs Python 3.11, so on 3.10 only the tests run).
 [dependency-groups]
-dev = ["pytest>=8", "httpx>=0.27", "starlette>=0.40", "fastapi>=0.115", "django>=5.0", "celery>=5.4", "flask>=3.0", "requests>=2.31", "types-requests>=2.31",
-       "mypy>=2.4", "pyright>=1.1.414", "django-stubs>=6.1", "celery-types>=0.26", "anthropic>=1.0",
-       "openai>=1.66", "opentelemetry-api>=1.30"]
+test = ["pytest>=8", "httpx>=0.27", "starlette>=0.40", "fastapi>=0.115", "django>=5.0", "celery>=5.4", "flask>=3.0",
+        "requests>=2.31", "anthropic>=1.0", "openai>=1.66", "opentelemetry-api>=1.30"]
+lint = ["ruff==0.14.7", "mypy>=2.4", "pyright>=1.1.414", "types-requests>=2.31",
+        "django-stubs>=6.1; python_version >= '3.11'", "celery-types>=0.26"]
+dev = [{ include-group = "test" }, { include-group = "lint" }]
 
 [tool.hatch.version]
 path = "src/fixwire/_version.py"
